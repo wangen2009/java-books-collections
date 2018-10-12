@@ -1,4 +1,9 @@
 
+# Bookmarks
+
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=utf-8">
+<DT>
+
 ### 架构
 
 <DL><P>
@@ -151,4 +156,4 @@
 <DT>[从铁路订票系统看高并发网站技术解决之道](http://subject.csdn.net/traintech/)
 <DT>[高并发量网站解决方案 - y_h_t的专栏 - 博客频道 - CSDN.NET](http://blog.csdn.net/y_h_t/article/details/6322823)
 </DL><P>
-</DL><P>
+</DL><P>**
