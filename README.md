@@ -139,6 +139,11 @@
 - [从铁路订票系统看高并发网站技术解决之道](http://subject.csdn.net/traintech/)
 - [高并发量网站解决方案 - y_h_t的专栏 - 博客频道 - CSDN.NET](http://blog.csdn.net/y_h_t/article/details/6322823)
 
+
+### 支付架构相关
+
+- [[支付渠道和支付路由]](https://zhuanlan.zhihu.com/p/33349931)
+- [[非第三方支付的互联网领域平台对账系统设计]](https://www.phyet.com/balancing/)
 </DL><P>**
 
 
