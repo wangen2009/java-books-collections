@@ -144,6 +144,15 @@
 
 - [[支付渠道和支付路由]](https://zhuanlan.zhihu.com/p/33349931)
 - [[非第三方支付的互联网领域平台对账系统设计]](https://www.phyet.com/balancing/)
+- [[支付相关的技术文档]](http://blog.lixf.cn/essay/2018/04/01/compliance/)
+
+
+### 事务相关
+
+### RocketMQ相关
+
+### Solr实战
+### Netty实战
 </DL><P>**
 
 
