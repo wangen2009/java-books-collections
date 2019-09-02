@@ -1,0 +1,380 @@
+<h1 class="heading">InnoDB 的 Buffer Pool</h1>
+<p>标签： MySQL 是怎样运行的</p>
+<hr>
+<h2 class="heading">缓存的重要性</h2>
+<p>通过前边的唠叨我们知道，对于使用<code>InnoDB</code>作为存储引擎的表来说，不管是用于存储用户数据的索引（包括聚簇索引和二级索引），还是各种系统数据，都是以<code>页</code>的形式存放在<code>表空间</code>中的，而所谓的<code>表空间</code>只不过是<code>InnoDB</code>对文件系统上一个或几个实际文件的抽象，也就是说我们的数据说到底还是存储在磁盘上的。但是各位也都知道，磁盘的速度慢的跟乌龟一样，怎么能配得上“快如风，疾如电”的<code>CPU</code>呢？所以<code>InnoDB</code>存储引擎在处理客户端的请求时，当需要访问某个页的数据时，就会把完整的页的数据全部加载到内存中，也就是说<span style="color:red">即使我们只需要访问一个页的一条记录，那也需要先把整个页的数据加载到内存中</span>。将整个页加载到内存中后就可以进行读写访问了，在进行完读写访问之后并不着急把该页对应的内存空间释放掉，而是将其<code>缓存</code>起来，这样将来有请求再次访问该页面时，就可以省去磁盘<code>IO</code>的开销了。</p>
+<h2 class="heading">InnoDB的Buffer Pool</h2>
+<h3 class="heading">啥是个Buffer Pool</h3>
+<p>设计<code>InnoDB</code>的大叔为了缓存磁盘中的页，在<code>MySQL</code>服务器启动的时候就向操作系统申请了一片连续的内存，他们给这片内存起了个名，叫做<code>Buffer Pool</code>（中文名是<code>缓冲池</code>）。那它有多大呢？这个其实看我们机器的配置，如果你是土豪，你有<code>512G</code>内存，你分配个几百G作为<code>Buffer Pool</code>也可以啊，当然你要是没那么有钱，设置小点也行呀～ 默认情况下<code>Buffer Pool</code>只有<code>128M</code>大小。当然如果你嫌弃这个<code>128M</code>太大或者太小，可以在启动服务器的时候配置<code>innodb_buffer_pool_size</code>参数的值，它表示<code>Buffer Pool</code>的大小，就像这样：</p>
+<pre><code class="hljs bash" lang="bash">[server]
+innodb_buffer_pool_size = 268435456
+</code></pre><p>其中，<code>268435456</code>的单位是字节，也就是我指定<code>Buffer Pool</code>的大小为<code>256M</code>。需要注意的是，<code>Buffer Pool</code>也不能太小，最小值为<code>5M</code>(当小于该值时会自动设置成<code>5M</code>)。</p>
+<h3 class="heading">Buffer Pool内部组成</h3>
+<p><code>Buffer Pool</code>中默认的缓存页大小和在磁盘上默认的页大小是一样的，都是<code>16KB</code>。为了更好的管理这些在<code>Buffer Pool</code>中的缓存页，设计<code>InnoDB</code>的大叔为每一个缓存页都创建了一些所谓的<code>控制信息</code>，这些控制信息包括该页所属的表空间编号、页号、缓存页在<code>Buffer Pool</code>中的地址、链表节点信息、一些锁信息以及<code>LSN</code>信息（锁和<code>LSN</code>我们之后会具体唠叨，现在可以先忽略），当然还有一些别的控制信息，我们这就不全唠叨一遍了，挑重要的说嘛～</p>
+<p>每个缓存页对应的控制信息占用的内存大小是相同的，我们就把每个页对应的控制信息占用的一块内存称为一个<code>控制块</code>吧，<span style="color:red">控制块和缓存页是一一对应的，它们都被存放到 Buffer Pool 中，其中控制块被存放到 Buffer Pool 的前边，缓存页被存放到 Buffer Pool 后边</span>，所以整个<code>Buffer Pool</code>对应的内存空间看起来就是这样的：</p>
+<p></p><figure><img alt="image_1d15mh3d4oadq0e1qpme22u8i61.png-47.4kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e2b9d6dd1?w=1004&amp;h=339&amp;f=png&amp;s=48567"><figcaption></figcaption></figure><p></p>
+<p>咦？控制块和缓存页之间的那个<code>碎片</code>是个什么玩意儿？你想想啊，每一个控制块都对应一个缓存页，那在分配足够多的控制块和缓存页后，可能剩余的那点儿空间不够一对控制块和缓存页的大小，自然就用不到喽，这个用不到的那点儿内存空间就被称为<code>碎片</code>了。当然，如果你把<code>Buffer Pool</code>的大小设置的刚刚好的话，也可能不会产生<code>碎片</code>～</p>
+<blockquote class="warning"><p>小贴士：
+
+每个控制块大约占用缓存页大小的5%，在MySQL5.7.21这个版本中，每个控制块占用的大小是808字节。而我们设置的innodb_buffer_pool_size并不包含这部分控制块占用的内存空间大小，也就是说InnoDB在为Buffer Pool向操作系统申请连续的内存空间时，这片连续的内存空间一般会比innodb_buffer_pool_size的值大5%左右。
+</p></blockquote><h3 class="heading">free链表的管理</h3>
+<p>当我们最初启动<code>MySQL</code>服务器的时候，需要完成对<code>Buffer Pool</code>的初始化过程，就是先向操作系统申请<code>Buffer Pool</code>的内存空间，然后把它划分成若干对控制块和缓存页。但是此时并没有真实的磁盘页被缓存到<code>Buffer Pool</code>中（因为还没有用到），之后随着程序的运行，会不断的有磁盘上的页被缓存到<code>Buffer Pool</code>中。那么问题来了，从磁盘上读取一个页到<code>Buffer Pool</code>中的时候该放到哪个缓存页的位置呢？或者说怎么区分<code>Buffer Pool</code>中哪些缓存页是空闲的，哪些已经被使用了呢？<span style="color:red">我们最好在某个地方记录一下Buffer Pool中哪些缓存页是可用的</span>，这个时候缓存页对应的<code>控制块</code>就派上大用场了，我们可以<span style="color:red">把所有空闲的缓存页对应的控制块作为一个节点放到一个链表中</span>，这个链表也可以被称作<code>free链表</code>（或者说空闲链表）。刚刚完成初始化的<code>Buffer Pool</code>中所有的缓存页都是空闲的，所以每一个缓存页对应的控制块都会被加入到<code>free链表</code>中，假设该<code>Buffer Pool</code>中可容纳的缓存页数量为<code>n</code>，那增加了<code>free链表</code>的效果图就是这样的：</p>
+<p></p><figure><img alt="image_1d155te021bmgjt09mo1lln17dum.png-132.6kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e300173c1?w=1010&amp;h=606&amp;f=png&amp;s=135745"><figcaption></figcaption></figure><p></p>
+<p>从图中可以看出，我们为了管理好这个<code>free链表</code>，特意为这个链表定义了一个<code>基节点</code>，里边儿包含着链表的头节点地址，尾节点地址，以及当前链表中节点的数量等信息。这里需要注意的是，链表的基节点占用的内存空间并不包含在为<code>Buffer Pool</code>申请的一大片连续内存空间之内，而是单独申请的一块内存空间。</p>
+<blockquote class="warning"><p>小贴士：
+
+链表基节点占用的内存空间并不大，在MySQL5.7.21这个版本里，每个基节点只占用40字节大小。后边我们即将介绍许多不同的链表，它们的基节点和free链表的基节点的内存分配方式是一样一样的，都是单独申请的一块40字节大小的内存空间，并不包含在为Buffer Pool申请的一大片连续内存空间之内。
+</p></blockquote><p>有了这个<code>free链表</code>之后事儿就好办了，每当需要从磁盘中加载一个页到<code>Buffer Pool</code>中时，就从<code>free链表</code>中取一个空闲的缓存页，并且把该缓存页对应的<code>控制块</code>的信息填上（就是该页所在的表空间、页号之类的信息），然后把该缓存页对应的<code>free链表</code>节点从链表中移除，表示该缓存页已经被使用了～</p>
+<h3 class="heading">缓存页的哈希处理</h3>
+<p>我们前边说过，当我们需要访问某个页中的数据时，就会把该页从磁盘加载到<code>Buffer Pool</code>中，如果该页已经在<code>Buffer Pool</code>中的话直接使用就可以了。那么问题也就来了，我们怎么知道该页在不在<code>Buffer Pool</code>中呢？难不成需要依次遍历<code>Buffer Pool</code>中各个缓存页么？一个<code>Buffer Pool</code>中的缓存页这么多都遍历完岂不是要累死？</p>
+<p>再回头想想，我们其实是根据<code>表空间号 + 页号</code>来定位一个页的，也就相当于<code>表空间号 + 页号</code>是一个<code>key</code>，<code>缓存页</code>就是对应的<code>value</code>，怎么通过一个<code>key</code>来快速找着一个<code>value</code>呢？哈哈，那肯定是哈希表喽～</p>
+<blockquote class="warning"><p>小贴士：
+
+啥？你别告诉我你不知道哈希表是个啥？我们这个文章不是讲哈希表的，如果你不会那就去找本数据结构的书看看吧～ 啥？外头的书看不懂？别急，等我～
+</p></blockquote><p>所以我们可以用<code>表空间号 + 页号</code>作为<code>key</code>，<code>缓存页</code>作为<code>value</code>创建一个哈希表，在需要访问某个页的数据时，先从哈希表中根据<code>表空间号 + 页号</code>看看有没有对应的缓存页，如果有，直接使用该缓存页就好，如果没有，那就从<code>free链表</code>中选一个空闲的缓存页，然后把磁盘中对应的页加载到该缓存页的位置。</p>
+<h3 class="heading">flush链表的管理</h3>
+<p>如果我们修改了<code>Buffer Pool</code>中某个缓存页的数据，那它就和磁盘上的页<span style="color:red">不一致</span>了，这样的缓存页也被称为<code>脏页</code>（英文名：<code>dirty page</code>）。当然，最简单的做法就是每发生一次修改就<span style="color:red">立即同步</span>到磁盘上对应的页上，但是频繁的往磁盘中写数据会严重的影响程序的性能（毕竟磁盘慢的像乌龟一样）。所以每次修改缓存页后，我们并不着急立即把修改同步到磁盘上，而是在未来的某个时间点进行同步，至于这个同步的时间点我们后边会作说明说明的，现在先不用管哈～</p>
+<p>但是如果不立即同步到磁盘的话，那之后再同步的时候我们怎么知道<code>Buffer Pool</code>中哪些页是<code>脏页</code>，哪些页从来没被修改过呢？总不能把所有的缓存页都同步到磁盘上吧，假如<code>Buffer Pool</code>被设置的很大，比方说<code>300G</code>，那一次性同步这么多数据岂不是要慢死！所以，我们不得不再创建一个存储脏页的链表，凡是修改过的缓存页对应的控制块都会作为一个节点加入到一个链表中，因为这个链表节点对应的缓存页都是需要被刷新到磁盘上的，所以也叫<code>flush链表</code>。链表的构造和<code>free链表</code>差不多，假设某个时间点<code>Buffer Pool</code>中的脏页数量为<code>n</code>，那么对应的<code>flush链表</code>就长这样：</p>
+<p></p><figure><img alt="image_1d1589dpqmt5v1849s7614nu23.png-133.5kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e2ec4572a?w=1010&amp;h=591&amp;f=png&amp;s=136665"><figcaption></figcaption></figure><p></p>
+<h3 class="heading">LRU链表的管理</h3>
+<h4 class="heading">缓存不够的窘境</h4>
+<p><code>Buffer Pool</code>对应的内存大小毕竟是有限的，如果需要缓存的页占用的内存大小超过了<code>Buffer Pool</code>大小，也就是<code>free链表</code>中已经没有多余的空闲缓存页的时候岂不是很尴尬，发生了这样的事儿该咋办？当然是把某些旧的缓存页从<code>Buffer Pool</code>中移除，然后再把新的页放进来喽～ 那么问题来了，移除哪些缓存页呢？</p>
+<p>为了回答这个问题，我们还需要回到我们设立<code>Buffer Pool</code>的初衷，我们就是想减少和磁盘的<code>IO</code>交互，最好每次在访问某个页的时候它都已经被缓存到<code>Buffer Pool</code>中了。假设我们一共访问了<code>n</code>次页，那么被访问的页已经在缓存中的次数除以<code>n</code>就是所谓的<code>缓存命中率</code>，我们的期望就是让<code>缓存命中率</code>越高越好～ 从这个角度出发，回想一下我们的微信聊天列表，排在前边的都是最近很频繁使用的，排在后边的自然就是最近很少使用的，假如列表能容纳下的联系人有限，你是会把最近很频繁使用的留下还是最近很少使用的留下呢？废话，当然是留下最近很频繁使用的了～</p>
+<h4 class="heading">简单的LRU链表</h4>
+<p>管理<code>Buffer Pool</code>的缓存页其实也是这个道理，当<code>Buffer Pool</code>中不再有空闲的缓存页时，就需要淘汰掉部分最近很少使用的缓存页。不过，我们怎么知道哪些缓存页最近频繁使用，哪些最近很少使用呢？呵呵，神奇的链表再一次派上了用场，我们可以再创建一个链表，由于这个链表是为了<code>按照最近最少使用</code>的原则去淘汰缓存页的，所以这个链表可以被称为<code>LRU链表</code>（LRU的英文全称：Least Recently Used）。当我们需要访问某个页时，可以这样处理<code>LRU链表</code>：</p>
+<ul>
+<li>
+<p>如果该页不在<code>Buffer Pool</code>中，在把该页从磁盘加载到<code>Buffer Pool</code>中的缓存页时，就把该缓存页对应的<code>控制块</code>作为节点塞到链表的头部。</p>
+</li>
+<li>
+<p>如果该页已经缓存在<code>Buffer Pool</code>中，则直接把该页对应的<code>控制块</code>移动到<code>LRU链表</code>的头部。</p>
+</li>
+</ul>
+<p>也就是说：<span style="color:red">只要我们使用到某个缓存页，就把该缓存页调整到<code>LRU链表</code>的头部，这样<code>LRU链表</code>尾部就是最近最少使用的缓存页喽</span>～ 所以当<code>Buffer Pool</code>中的空闲缓存页使用完时，到<code>LRU链表</code>的尾部找些缓存页淘汰就OK啦，真简单，啧啧...</p>
+<h4 class="heading">划分区域的LRU链表</h4>
+<p>高兴的太早了，上边的这个简单的<code>LRU链表</code>用了没多长时间就发现问题了，因为存在这两种比较尴尬的情况：</p>
+<ul>
+<li>
+<p>情况一：<code>InnoDB</code>提供了一个看起来比较贴心的服务——<code>预读</code>（英文名：<code>read ahead</code>）。所谓<code>预读</code>，就是<code>InnoDB</code>认为执行当前的请求可能之后会读取某些页面，就预先把它们加载到<code>Buffer Pool</code>中。根据触发方式的不同，<code>预读</code>又可以细分为下边两种：</p>
+<ul>
+<li>
+<p>线性预读</p>
+<p>设计<code>InnoDB</code>的大叔提供了一个系统变量<code>innodb_read_ahead_threshold</code>，如果顺序访问了某个区（<code>extent</code>）的页面超过这个系统变量的值，就会触发一次<code>异步</code>读取下一个区中全部的页面到<code>Buffer Pool</code>的请求，注意<code>异步</code>读取意味着从磁盘中加载这些被预读的页面并不会影响到当前工作线程的正常执行。这个<code>innodb_read_ahead_threshold</code>系统变量的值默认是<code>56</code>，我们可以在服务器启动时通过启动参数或者服务器运行过程中直接调整该系统变量的值，不过它是一个全局变量，注意使用<code>SET GLOBAL</code>命令来修改哦。</p>
+<blockquote class="warning"><p>小贴士：
+
+InnoDB是怎么实现异步读取的呢？在Windows或者Linux平台上，可能是直接调用操作系统内核提供的AIO接口，在其它类Unix操作系统中，使用了一种模拟AIO接口的方式来实现异步读取，其实就是让别的线程去读取需要预读的页面。如果你读不懂上边这段话，那也就没必要懂了，和我们主题其实没太多关系，你只需要知道异步读取并不会影响到当前工作线程的正常执行就好了。其实这个过程涉及到操作系统如何处理IO以及多线程的问题，找本操作系统的书看看吧，什么？操作系统的书写的都很难懂？没关系，等我～
+ 
+</p></blockquote></li>
+<li>
+<p>随机预读</p>
+<p>如果<code>Buffer Pool</code>中已经缓存了某个区的13个连续的页面，不论这些页面是不是顺序读取的，都会触发一次<code>异步</code>读取本区中所有其的页面到<code>Buffer Pool</code>的请求。设计<code>InnoDB</code>的大叔同时提供了<code>innodb_random_read_ahead</code>系统变量，它的默认值为<code>OFF</code>，也就意味着<code>InnoDB</code>并不会默认开启随机预读的功能，如果我们想开启该功能，可以通过修改启动参数或者直接使用<code>SET GLOBAL</code>命令把该变量的值设置为<code>ON</code>。</p>
+</li>
+</ul>
+<p><code>预读</code>本来是个好事儿，如果预读到<code>Buffer Pool</code>中的页成功的被使用到，那就可以极大的提高语句执行的效率。可是如果用不到呢？这些预读的页都会放到<code>LRU</code>链表的头部，但是如果此时<code>Buffer Pool</code>的容量不太大而且很多预读的页面都没有用到的话，这就会导致处在<code>LRU链表</code>尾部的一些缓存页会很快的被淘汰掉，也就是所谓的<code>劣币驱逐良币</code>，<span style="color:red">会大大降低缓存命中率</span>。</p>
+</li>
+<li>
+<p>情况二：有的小伙伴可能会写一些需要扫描全表的查询语句（比如没有建立合适的索引或者压根儿没有WHERE子句的查询）。</p>
+<p>扫描全表意味着什么？意味着将访问到该表所在的所有页！假设这个表中记录非常多的话，那该表会占用特别多的<code>页</code>，当需要访问这些页时，会把它们统统都加载到<code>Buffer Pool</code>中，这也就意味着吧唧一下，<code>Buffer Pool</code>中的所有页都被换了一次血，其他查询语句在执行时又得执行一次从磁盘加载到<code>Buffer Pool</code>的操作。而这种全表扫描的语句执行的频率也不高，每次执行都要把<code>Buffer Pool</code>中的缓存页换一次血，这严重的影响到其他查询对 <code>Buffer Pool</code>的使用，从而<span style="color:red">大大降低了缓存命中率</span>。</p>
+</li>
+</ul>
+<p>总结一下上边说的可能降低<code>Buffer Pool</code>的两种情况：</p>
+<ul>
+<li>
+<p>加载到<code>Buffer Pool</code>中的页不一定被用到。</p>
+</li>
+<li>
+<p>如果非常多的使用频率偏低的页被同时加载到<code>Buffer Pool</code>时，可能会把那些使用频率非常高的页从<code>Buffer Pool</code>中淘汰掉。</p>
+</li>
+</ul>
+<p>因为有这两种情况的存在，所以设计<code>InnoDB</code>的大叔把这个<code>LRU链表</code>按照一定比例分成两截，分别是：</p>
+<ul>
+<li>
+<p>一部分存储使用频率非常高的缓存页，所以这一部分链表也叫做<code>热数据</code>，或者称<code>young区域</code>。</p>
+</li>
+<li>
+<p>另一部分存储使用频率不是很高的缓存页，所以这一部分链表也叫做<code>冷数据</code>，或者称<code>old区域</code>。</p>
+</li>
+</ul>
+<p>为了方便大家理解，我们把示意图做了简化，各位领会精神就好：</p>
+<p></p><figure><img alt="image_1d15fb53d2lf13ovglg1rnv1h2n2g.png-116.5kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e2a3fffa3?w=1097&amp;h=460&amp;f=png&amp;s=119309"><figcaption></figcaption></figure><p></p>
+<p>大家要特别注意一个事儿：<span style="color:red">我们是按照某个比例将LRU链表分成两半的，不是某些节点固定是young区域的，某些节点固定是old区域的，随着程序的运行，某个节点所属的区域也可能发生变化</span>。那这个划分成两截的比例怎么确定呢？对于<code>InnoDB</code>存储引擎来说，我们可以通过查看系统变量<code>innodb_old_blocks_pct</code>的值来确定<code>old</code>区域在<code>LRU链表</code>中所占的比例，比方说这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; SHOW VARIABLES LIKE <span class="hljs-string">'innodb_old_blocks_pct'</span>;
++-----------------------+-------+
+| Variable_name         | Value |
++-----------------------+-------+
+| innodb_old_blocks_pct | 37    |
++-----------------------+-------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.01 sec)
+</code></pre><p>从结果可以看出来，默认情况下，<code>old</code>区域在<code>LRU链表</code>中所占的比例是<code>37%</code>，也就是说<code>old</code>区域大约占<code>LRU链表</code>的<code>3/8</code>。这个比例我们是可以设置的，我们可以在启动时修改<code>innodb_old_blocks_pct</code>参数来控制<code>old</code>区域在<code>LRU链表</code>中所占的比例，比方说这样修改配置文件：</p>
+<pre><code class="hljs bash" lang="bash">[server]
+innodb_old_blocks_pct = 40
+</code></pre><p>这样我们在启动服务器后，<code>old</code>区域占<code>LRU链表</code>的比例就是<code>40%</code>。当然，如果在服务器运行期间，我们也可以修改这个系统变量的值，不过需要注意的是，这个系统变量属于<code>全局变量</code>，一经修改，会对所有客户端生效，所以我们只能这样修改：</p>
+<pre><code class="hljs bash" lang="bash">SET GLOBAL innodb_old_blocks_pct = 40;
+</code></pre><p>有了这个被划分成<code>young</code>和<code>old</code>区域的<code>LRU</code>链表之后，设计<code>InnoDB</code>的大叔就可以针对我们上边提到的两种可能降低缓存命中率的情况进行优化了：</p>
+<ul>
+<li>
+<p>针对预读的页面可能不进行后续访情况的优化</p>
+<p>设计<code>InnoDB</code>的大叔规定，<span style="color:red">当磁盘上的某个页面在初次加载到Buffer Pool中的某个缓存页时，该缓存页对应的控制块会被放到old区域的头部</span>。这样针对预读到<code>Buffer Pool</code>却不进行后续访问的页面就会被逐渐从<code>old</code>区域逐出，而不会影响<code>young</code>区域中被使用比较频繁的缓存页。</p>
+</li>
+<li>
+<p>针对全表扫描时，短时间内访问大量使用频率非常低的页面情况的优化</p>
+<p>在进行全表扫描时，虽然首次被加载到<code>Buffer Pool</code>的页被放到了<code>old</code>区域的头部，但是后续会被马上访问到，每次进行访问的时候又会把该页放到<code>young</code>区域的头部，这样仍然会把那些使用频率比较高的页面给顶下去。有同学会想：可不可以在第一次访问该页面时不将其从<code>old</code>区域移动到<code>young</code>区域的头部，后续访问时再将其移动到<code>young</code>区域的头部。回答是：行不通！因为设计<code>InnoDB</code>的大叔规定每次去页面中读取一条记录时，都算是访问一次页面，而一个页面中可能会包含很多条记录，也就是说读取完某个页面的记录就相当于访问了这个页面好多次。</p>
+<p>咋办？全表扫描有一个特点，那就是它的执行频率非常低，谁也不会没事儿老在那写全表扫描的语句玩，而且在执行全表扫描的过程中，即使某个页面中有很多条记录，也就是去多次访问这个页面所花费的时间也是非常少的。所以我们只需要规定，<span style="color:red">在对某个处在<code>old</code>区域的缓存页进行第一次访问时就在它对应的控制块中记录下来这个访问时间，如果后续的访问时间与第一次访问的时间在某个时间间隔内，那么该页面就不会被从old区域移动到young区域的头部，否则将它移动到young区域的头部</span>。上述的这个间隔时间是由系统变量<code>innodb_old_blocks_time</code>控制的，你看：</p>
+</li>
+</ul>
+<pre><code class="hljs bash" lang="bash">mysql&gt; SHOW VARIABLES LIKE <span class="hljs-string">'innodb_old_blocks_time'</span>;
++------------------------+-------+
+| Variable_name          | Value |
++------------------------+-------+
+| innodb_old_blocks_time | 1000  |
++------------------------+-------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.01 sec)
+</code></pre><p>这个<code>innodb_old_blocks_time</code>的默认值是<code>1000</code>，它的单位是毫秒，也就意味着对于从磁盘上被加载到<code>LRU</code>链表的<code>old</code>区域的某个页来说，如果第一次和最后一次访问该页面的时间间隔小于<code>1s</code>（很明显在一次全表扫描的过程中，多次访问一个页面中的时间不会超过<code>1s</code>），那么该页是不会被加入到<code>young</code>区域的～ 当然，像<code>innodb_old_blocks_pct</code>一样，我们也可以在服务器启动或运行时设置<code>innodb_old_blocks_time</code>的值，这里就不赘述了，你自己试试吧～ 这里需要注意的是，如果我们把<code>innodb_old_blocks_time</code>的值设置为<code>0</code>，那么每次我们访问一个页面时就会把该页面放到<code>young</code>区域的头部。</p>
+<p>综上所述，正是因为将<code>LRU</code>链表划分为<code>young</code>和<code>old</code>区域这两个部分，又添加了<code>innodb_old_blocks_time</code>这个系统变量，才使得预读机制和全表扫描造成的缓存命中率降低的问题得到了遏制，因为用不到的预读页面以及全表扫描的页面都只会被放到<code>old</code>区域，而不影响<code>young</code>区域中的缓存页。</p>
+<h4 class="heading">更进一步优化LRU链表</h4>
+<p><code>LRU链表</code>这就说完了么？没有，早着呢～ 对于<code>young</code>区域的缓存页来说，我们每次访问一个缓存页就要把它移动到<code>LRU链表</code>的头部，这样开销是不是太大啦，毕竟在<code>young</code>区域的缓存页都是热点数据，也就是可能被经常访问的，这样频繁的对<code>LRU链表</code>进行节点移动操作是不是不太好啊？是的，为了解决这个问题其实我们还可以提出一些优化策略，比如只有被访问的缓存页位于<code>young</code>区域的<code>1/4</code>的后边，才会被移动到<code>LRU链表</code>头部，这样就可以降低调整<code>LRU链表</code>的频率，从而提升性能（也就是说如果某个缓存页对应的节点在<code>young</code>区域的<code>1/4</code>中，再次访问该缓存页时也不会将其移动到<code>LRU</code>链表头部）。</p>
+<blockquote class="warning"><p>小贴士：
+
+我们之前介绍随机预读的时候曾说，如果Buffer Pool中有某个区的13个连续页面就会触发随机预读，这其实是不严谨的（不幸的是MySQL文档就是这么说的[摊手]），其实还要求这13个页面是非常热的页面，所谓的非常热，指的是这些页面在整个young区域的头1/4处。
+
+</p></blockquote><p>还有没有什么别的针对<code>LRU链表</code>的优化措施呢？当然有啊，你要是好好学，写篇论文，写本书都不是问题，可是这毕竟是一个介绍<code>MySQL</code>基础知识的文章，再说多了篇幅就受不了了，也影响大家的阅读体验，所以适可而止，想了解更多的优化知识，自己去看源码或者更多关于<code>LRU</code>链表的知识喽～ 但是不论怎么优化，千万别忘了我们的初心：<span style="color:red">尽量高效的提高 <em><strong>Buffer Pool</strong></em> 的缓存命中率</span>。</p>
+<h3 class="heading">其他的一些链表</h3>
+<p>为了更好的管理<code>Buffer Pool</code>中的缓存页，除了我们上边提到的一些措施，设计<code>InnoDB</code>的大叔们还引进了其他的一些<code>链表</code>，比如<code>unzip LRU链表</code>用于管理解压页，<code>zip clean链表</code>用于管理没有被解压的压缩页，<code>zip free数组</code>中每一个元素都代表一个链表，它们组成所谓的<code>伙伴系统</code>来为压缩页提供内存空间等等，反正是为了更好的管理这个<code>Buffer Pool</code>引入了各种链表或其他数据结构，具体的使用方式就不啰嗦了，大家有兴趣深究的再去找些更深的书或者直接看源代码吧，也可以直接来找我哈～</p>
+<pre><code class="hljs bash" lang="bash">小贴士：
+
+我们压根儿没有深入唠叨过InnoDB中的压缩页，对上边的这些链表也只是为了完整性顺便提一下，如果你看不懂千万不要抑郁，因为我压根儿就没打算向大家介绍它们。
+</code></pre><h3 class="heading">刷新脏页到磁盘</h3>
+<p>后台有专门的线程每隔一段时间负责把脏页刷新到磁盘，这样可以不影响用户线程处理正常的请求。主要有两种刷新路径：</p>
+<ul>
+<li>
+<p>从<code>LRU链表</code>的冷数据中刷新一部分页面到磁盘。</p>
+<p>后台线程会定时从<code>LRU链表</code>尾部开始扫描一些页面，扫描的页面数量可以通过系统变量<code>innodb_lru_scan_depth</code>来指定，如果从里边儿发现脏页，会把它们刷新到磁盘。这种刷新页面的方式被称之为<code>BUF_FLUSH_LRU</code>。</p>
+</li>
+<li>
+<p>从<code>flush链表</code>中刷新一部分页面到磁盘。</p>
+<p>后台线程也会定时从<code>flush链表</code>中刷新一部分页面到磁盘，刷新的速率取决于当时系统是不是很繁忙。这种刷新页面的方式被称之为<code>BUF_FLUSH_LIST</code>。</p>
+</li>
+</ul>
+<p>有时候后台线程刷新脏页的进度比较慢，导致用户线程在准备加载一个磁盘页到<code>Buffer Pool</code>时没有可用的缓存页，这时就会尝试看看<code>LRU链表</code>尾部有没有可以直接释放掉的未修改页面，如果没有的话会不得不将<code>LRU链表</code>尾部的一个脏页同步刷新到磁盘（和磁盘交互是很慢的，这会降低处理用户请求的速度）。这种刷新单个页面到磁盘中的刷新方式被称之为<code>BUF_FLUSH_SINGLE_PAGE</code>。</p>
+<p>当然，有时候系统特别繁忙时，也可能出现用户线程批量的从<code>flush链表</code>中刷新脏页的情况，很显然在处理用户请求过程中去刷新脏页是一种严重降低处理速度的行为（毕竟磁盘的速度满的要死），这属于一种迫不得已的情况，不过这得放在后边唠叨<code>redo</code>日志的<code>checkpoint</code>时说了。</p>
+<h3 class="heading">多个Buffer Pool实例</h3>
+<p>我们上边说过，<code>Buffer Pool</code>本质是<code>InnoDB</code>向操作系统申请的一块连续的内存空间，在多线程环境下，访问<code>Buffer Pool</code>中的各种链表都需要加锁处理啥的，在<code>Buffer Pool</code>特别大而且多线程并发访问特别高的情况下，单一的<code>Buffer Pool</code>可能会影响请求的处理速度。所以在<code>Buffer Pool</code>特别大的时候，我们可以把它们拆分成若干个小的<code>Buffer Pool</code>，每个<code>Buffer Pool</code>都称为一个<code>实例</code>，它们都是独立的，独立的去申请内存空间，独立的管理各种链表，独立的吧啦吧啦，所以在多线程并发访问时并不会相互影响，从而提高并发处理能力。我们可以在服务器启动的时候通过设置<code>innodb_buffer_pool_instances</code>的值来修改<code>Buffer Pool</code>实例的个数，比方说这样：</p>
+<pre><code class="hljs bash" lang="bash">[server]
+innodb_buffer_pool_instances = 2
+</code></pre><p>这样就表明我们要创建2个<code>Buffer Pool</code>实例，示意图就是这样：</p>
+<p></p><figure><img alt="image_1d15nmrbi19mv1tbk191eoqbmb47e.png-87.2kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e2abd79c1?w=1089&amp;h=444&amp;f=png&amp;s=89286"><figcaption></figcaption></figure><p></p>
+<blockquote class="warning"><p>小贴士：
+
+为了简便，我只把各个链表的基节点画出来了，大家应该心里清楚这些链表的节点其实就是每个缓存页对应的控制块！
+</p></blockquote><p>那每个<code>Buffer Pool</code>实例实际占多少内存空间呢？其实使用这个公式算出来的：</p>
+<pre><code class="hljs bash" lang="bash">innodb_buffer_pool_size/innodb_buffer_pool_instances
+</code></pre><p>也就是总共的大小除以实例的个数，结果就是每个<code>Buffer Pool</code>实例占用的大小。</p>
+<p>不过也不是说<code>Buffer Pool</code>实例创建的越多越好，分别管理各个<code>Buffer Pool</code>也是需要性能开销的，设计<code>InnoDB</code>的大叔们规定：<span style="color:red">当innodb_buffer_pool_size的值小于1G的时候设置多个实例是无效的，InnoDB会默认把innodb_buffer_pool_instances 的值修改为1</span>。而我们鼓励在<code>Buffer Pool</code>大小或等于1G的时候设置多个<code>Buffer Pool</code>实例。</p>
+<h3 class="heading">innodb_buffer_pool_chunk_size</h3>
+<p>在<code>MySQL 5.7.5</code>之前，<code>Buffer Pool</code>的大小只能在服务器启动时通过配置<code>innodb_buffer_pool_size</code>启动参数来调整大小，在服务器运行过程中是不允许调整该值的。不过设计<code>MySQL</code>的大叔在<code>5.7.5</code>以及之后的版本中支持了在服务器运行过程中调整<code>Buffer Pool</code>大小的功能，但是有一个问题，就是每次当我们要重新调整<code>Buffer Pool</code>大小时，都需要重新向操作系统申请一块连续的内存空间，然后将旧的<code>Buffer Pool</code>中的内容复制到这一块新空间，这是极其耗时的。所以设计<code>MySQL</code>的大叔们决定不再一次性为某个<code>Buffer Pool</code>实例向操作系统申请一大片连续的内存空间，而是以一个所谓的<code>chunk</code>为单位向操作系统申请空间。也就是说一个<code>Buffer Pool</code>实例其实是由若干个<code>chunk</code>组成的，一个<code>chunk</code>就代表一片连续的内存空间，里边儿包含了若干缓存页与其对应的控制块，画个图表示就是这样：</p>
+<p></p><figure><img alt="image_1d15r7te41q58egj1b4plh615ug7r.png-125.5kB" src="https://user-gold-cdn.xitu.io/2019/3/2/1693e86e2a5de8f2?w=1112&amp;h=553&amp;f=png&amp;s=128507"><figcaption></figcaption></figure><p></p>
+<p>上图代表的<code>Buffer Pool</code>就是由2个实例组成的，每个实例中又包含2个<code>chunk</code>。</p>
+<p>正是因为发明了这个<code>chunk</code>的概念，我们在服务器运行期间调整<code>Buffer Pool</code>的大小时就是以<code>chunk</code>为单位增加或者删除内存空间，而不需要重新向操作系统申请一片大的内存，然后进行缓存页的复制。这个所谓的<code>chunk</code>的大小是我们在启动操作<code>MySQL</code>服务器时通过<code>innodb_buffer_pool_chunk_size</code>启动参数指定的，它的默认值是<code>134217728</code>，也就是<code>128M</code>。不过需要注意的是，<span style="color:red">innodb_buffer_pool_chunk_size的值只能在服务器启动时指定，在服务器运行过程中是不可以修改的</span>。</p>
+<blockquote class="warning"><p>小贴士：
+
+为什么不允许在服务器运行过程中修改innodb_buffer_pool_chunk_size的值？还不是因为innodb_buffer_pool_chunk_size的值代表InnoDB向操作系统申请的一片连续的内存空间的大小，如果你在服务器运行过程中修改了该值，就意味着要重新向操作系统申请连续的内存空间并且将原先的缓存页和它们对应的控制块复制到这个新的内存空间中，这是十分耗时的操作！
+
+另外，这个innodb_buffer_pool_chunk_size的值并不包含缓存页对应的控制块的内存空间大小，所以实际上InnoDB向操作系统申请连续内存空间时，每个chunk的大小要比innodb_buffer_pool_chunk_size的值大一些，约5%。
+</p></blockquote><h3 class="heading">配置Buffer Pool时的注意事项</h3>
+<ul>
+<li>
+<p><code>innodb_buffer_pool_size</code>必须是<code>innodb_buffer_pool_chunk_size × innodb_buffer_pool_instances</code>的倍数（这主要是想保证每一个<code>Buffer Pool</code>实例中包含的<code>chunk</code>数量相同）。</p>
+<p>假设我们指定的<code>innodb_buffer_pool_chunk_size</code>的值是<code>128M</code>，<code>innodb_buffer_pool_instances</code>的值是<code>16</code>，那么这两个值的乘积就是<code>2G</code>，也就是说<code>innodb_buffer_pool_size</code>的值必须是<code>2G</code>或者<code>2G</code>的整数倍。比方说我们在启动<code>MySQL</code>服务器是这样指定启动参数的：</p>
+<pre><code class="hljs bash" lang="bash">mysqld --innodb-buffer-pool-size=8G --innodb-buffer-pool-instances=16
+</code></pre><p>默认的<code>innodb_buffer_pool_chunk_size</code>值是<code>128M</code>，指定的<code>innodb_buffer_pool_instances</code>的值是<code>16</code>，所以<code>innodb_buffer_pool_size</code>的值必须是<code>2G</code>或者<code>2G</code>的整数倍，上边例子中指定的<code>innodb_buffer_pool_size</code>的值是<code>8G</code>，符合规定，所以在服务器启动完成之后我们查看一下该变量的值就是我们指定的<code>8G</code>（8589934592字节）：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; show variables like <span class="hljs-string">'innodb_buffer_pool_size'</span>;
++-------------------------+------------+
+| Variable_name           | Value      |
++-------------------------+------------+
+| innodb_buffer_pool_size | 8589934592 |
++-------------------------+------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.00 sec)
+</code></pre><p>如果我们指定的<code>innodb_buffer_pool_size</code>大于<code>2G</code>并且不是<code>2G</code>的整数倍，那么服务器会自动的把<code>innodb_buffer_pool_size</code>的值调整为<code>2G</code>的整数倍，比方说我们在启动服务器时指定的<code>innodb_buffer_pool_size</code>的值是<code>9G</code>：</p>
+<pre><code class="hljs bash" lang="bash">mysqld --innodb-buffer-pool-size=9G --innodb-buffer-pool-instances=16
+</code></pre><p>那么服务器会自动把<code>innodb_buffer_pool_size</code>的值调整为<code>10G</code>（10737418240字节），不信你看：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; show variables like <span class="hljs-string">'innodb_buffer_pool_size'</span>;
++-------------------------+-------------+
+| Variable_name           | Value       |
++-------------------------+-------------+
+| innodb_buffer_pool_size | 10737418240 |
++-------------------------+-------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.01 sec)
+</code></pre></li>
+<li>
+<p>如果在服务器启动时，<code>innodb_buffer_pool_chunk_size × innodb_buffer_pool_instances</code>的值已经大于<code>innodb_buffer_pool_size</code>的值，那么<code>innodb_buffer_pool_chunk_size</code>的值会被服务器自动设置为<code>innodb_buffer_pool_size/innodb_buffer_pool_instances</code>的值。</p>
+<p>比方说我们在启动服务器时指定的<code>innodb_buffer_pool_size</code>的值为<code>2G</code>，<code>innodb_buffer_pool_instances</code>的值为16，<code>innodb_buffer_pool_chunk_size</code>的值为<code>256M</code>：</p>
+<pre><code class="hljs bash" lang="bash">mysqld --innodb-buffer-pool-size=2G --innodb-buffer-pool-instances=16 --innodb-buffer-pool-chunk-size=256M
+</code></pre><p>由于<code>256M × 16 = 4G</code>，而<code>4G &gt; 2G</code>，所以<code>innodb_buffer_pool_chunk_size</code>值会被服务器改写为<code>innodb_buffer_pool_size/innodb_buffer_pool_instances</code>的值，也就是：<code>2G/16 = 128M</code>（134217728字节），不信你看：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; show variables like <span class="hljs-string">'innodb_buffer_pool_size'</span>;
++-------------------------+------------+
+| Variable_name           | Value      |
++-------------------------+------------+
+| innodb_buffer_pool_size | 2147483648 |
++-------------------------+------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.01 sec)
+
+mysql&gt; show variables like <span class="hljs-string">'innodb_buffer_pool_chunk_size'</span>;
++-------------------------------+-----------+
+| Variable_name                 | Value     |
++-------------------------------+-----------+
+| innodb_buffer_pool_chunk_size | 134217728 |
++-------------------------------+-----------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.00 sec)
+</code></pre></li>
+</ul>
+<h3 class="heading">Buffer Pool中存储的其它信息</h3>
+<p><code>Buffer Pool</code>的缓存页除了用来缓存磁盘上的页面以外，还可以存储锁信息、自适应哈希索引等信息，这些内容等我们之后遇到了再详细讨论哈～</p>
+<h3 class="heading">查看Buffer Pool的状态信息</h3>
+<p>设计<code>MySQL</code>的大叔贴心的给我们提供了<code>SHOW ENGINE INNODB STATUS</code>语句来查看关于<code>InnoDB</code>存储引擎运行过程中的一些状态信息，其中就包括<code>Buffer Pool</code>的一些信息，我们看一下（为了突出重点，我们只把输出中关于<code>Buffer Pool</code>的部分提取了出来）：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; SHOW ENGINE INNODB STATUS\G
+
+(...省略前边的许多状态)
+----------------------
+BUFFER POOL AND MEMORY
+----------------------
+Total memory allocated 13218349056;
+Dictionary memory allocated 4014231
+Buffer pool size   786432
+Free buffers       8174
+Database pages     710576
+Old database pages 262143
+Modified db pages  124941
+Pending reads 0
+Pending writes: LRU 0, flush list 0, single page 0
+Pages made young 6195930012, not young 78247510485
+108.18 youngs/s, 226.15 non-youngs/s
+Pages <span class="hljs-built_in">read</span> 2748866728, created 29217873, written 4845680877
+160.77 reads/s, 3.80 creates/s, 190.16 writes/s
+Buffer pool hit rate 956 / 1000, young-making rate 30 / 1000 not 605 / 1000
+Pages <span class="hljs-built_in">read</span> ahead 0.00/s, evicted without access 0.00/s, Random <span class="hljs-built_in">read</span> ahead 0.00/s
+LRU len: 710576, unzip_LRU len: 118
+I/O sum[134264]:cur[144], unzip sum[16]:cur[0]
+--------------
+(...省略后边的许多状态)
+
+mysql&gt;
+</code></pre><p>我们来详细看一下这里边的每个值都代表什么意思：</p>
+<ul>
+<li>
+<p><code>Total memory allocated</code>：代表<code>Buffer Pool</code>向操作系统申请的连续内存空间大小，包括全部控制块、缓存页、以及碎片的大小。</p>
+</li>
+<li>
+<p><code>Dictionary memory allocated</code>：为数据字典信息分配的内存空间大小，注意这个内存空间和<code>Buffer Pool</code>没啥关系，不包括在<code>Total memory allocated</code>中。</p>
+</li>
+<li>
+<p><code>Buffer pool size</code>：代表该<code>Buffer Pool</code>可以容纳多少缓存<code>页</code>，注意，单位是<code>页</code>！</p>
+</li>
+<li>
+<p><code>Free buffers</code>：代表当前<code>Buffer Pool</code>还有多少空闲缓存页，也就是<code>free链表</code>中还有多少个节点。</p>
+</li>
+<li>
+<p><code>Database pages</code>：代表<code>LRU</code>链表中的页的数量，包含<code>young</code>和<code>old</code>两个区域的节点数量。</p>
+</li>
+<li>
+<p><code>Old database pages</code>：代表<code>LRU</code>链表<code>old</code>区域的节点数量。</p>
+</li>
+<li>
+<p><code>Modified db pages</code>：代表脏页数量，也就是<code>flush链表</code>中节点的数量。</p>
+</li>
+<li>
+<p><code>Pending reads</code>：正在等待从磁盘上加载到<code>Buffer Pool</code>中的页面数量。</p>
+<p>当准备从磁盘中加载某个页面时，会先为这个页面在<code>Buffer Pool</code>中分配一个缓存页以及它对应的控制块，然后把这个控制块添加到<code>LRU</code>的<code>old</code>区域的头部，但是这个时候真正的磁盘页并没有被加载进来，<code>Pending reads</code>的值会跟着加1。</p>
+</li>
+<li>
+<p><code>Pending writes LRU</code>：即将从<code>LRU</code>链表中刷新到磁盘中的页面数量。</p>
+</li>
+<li>
+<p><code>Pending writes flush list</code>：即将从<code>flush</code>链表中刷新到磁盘中的页面数量。</p>
+</li>
+<li>
+<p><code>Pending writes single page</code>：即将以单个页面的形式刷新到磁盘中的页面数量。</p>
+</li>
+<li>
+<p><code>Pages made young</code>：代表<code>LRU</code>链表中曾经从<code>old</code>区域移动到<code>young</code>区域头部的节点数量。</p>
+<p>这里需要注意，一个节点每次只有从<code>old</code>区域移动到<code>young</code>区域头部时才会将<code>Pages made young</code>的值加1，也就是说如果该节点本来就在<code>young</code>区域，由于它符合在<code>young</code>区域1/4后边的要求，下一次访问这个页面时也会将它移动到<code>young</code>区域头部，但这个过程并不会导致<code>Pages made young</code>的值加1。</p>
+</li>
+<li>
+<p><code>Page made not young</code>：在将<code>innodb_old_blocks_time</code>设置的值大于0时，首次访问或者后续访问某个处在<code>old</code>区域的节点时由于不符合时间间隔的限制而不能将其移动到<code>young</code>区域头部时，<code>Page made not young</code>的值会加1。</p>
+<p>这里需要注意，对于处在<code>young</code>区域的节点，如果由于它在<code>young</code>区域的1/4处而导致它没有被移动到<code>young</code>区域头部，这样的访问并不会将<code>Page made not young</code>的值加1。</p>
+</li>
+<li>
+<p><code>youngs/s</code>：代表每秒从<code>old</code>区域被移动到<code>young</code>区域头部的节点数量。</p>
+</li>
+<li>
+<p><code>non-youngs/s</code>：代表每秒由于不满足时间限制而不能从<code>old</code>区域移动到<code>young</code>区域头部的节点数量。</p>
+</li>
+<li>
+<p><code>Pages read</code>、<code>created</code>、<code>written</code>：代表读取，创建，写入了多少页。后边跟着读取、创建、写入的速率。</p>
+</li>
+<li>
+<p><code>Buffer pool hit rate</code>：表示在过去某段时间，平均访问1000次页面，有多少次该页面已经被缓存到<code>Buffer Pool</code>了。</p>
+</li>
+<li>
+<p><code>young-making rate</code>：表示在过去某段时间，平均访问1000次页面，有多少次访问使页面移动到<code>young</code>区域的头部了。</p>
+<p>需要大家注意的一点是，这里统计的将页面移动到<code>young</code>区域的头部次数不仅仅包含从<code>old</code>区域移动到<code>young</code>区域头部的次数，还包括从<code>young</code>区域移动到<code>young</code>区域头部的次数（访问某个<code>young</code>区域的节点，只要该节点在<code>young</code>区域的1/4处往后，就会把它移动到<code>young</code>区域的头部）。</p>
+</li>
+<li>
+<p><code>not (young-making rate)</code>：表示在过去某段时间，平均访问1000次页面，有多少次访问没有使页面移动到<code>young</code>区域的头部。</p>
+<p>需要大家注意的一点是，这里统计的没有将页面移动到<code>young</code>区域的头部次数不仅仅包含因为设置了<code>innodb_old_blocks_time</code>系统变量而导致访问了<code>old</code>区域中的节点但没把它们移动到<code>young</code>区域的次数，还包含因为该节点在<code>young</code>区域的前1/4处而没有被移动到<code>young</code>区域头部的次数。</p>
+</li>
+<li>
+<p><code>LRU len</code>：代表<code>LRU链表</code>中节点的数量。</p>
+</li>
+<li>
+<p><code>unzip_LRU</code>：代表<code>unzip_LRU链表</code>中节点的数量（由于我们没有具体唠叨过这个链表，现在可以忽略它的值）。</p>
+</li>
+<li>
+<p><code>I/O sum</code>：最近50s读取磁盘页的总数。</p>
+</li>
+<li>
+<p><code>I/O cur</code>：现在正在读取的磁盘页数量。</p>
+</li>
+<li>
+<p><code>I/O unzip sum</code>：最近50s解压的页面数量。</p>
+</li>
+<li>
+<p><code>I/O unzip cur</code>：正在解压的页面数量。</p>
+</li>
+</ul>
+<h2 class="heading">总结</h2>
+<ol>
+<li>
+<p>磁盘太慢，用内存作为缓存很有必要。</p>
+</li>
+<li>
+<p><code>Buffer Pool</code>本质上是<code>InnoDB</code>向操作系统申请的一段连续的内存空间，可以通过<code>innodb_buffer_pool_size</code>来调整它的大小。</p>
+</li>
+<li>
+<p><code>Buffer Pool</code>向操作系统申请的连续内存由控制块和缓存页组成，每个控制块和缓存页都是一一对应的，在填充足够多的控制块和缓存页的组合后，<code>Buffer Pool</code>剩余的空间可能产生不够填充一组控制块和缓存页，这部分空间不能被使用，也被称为<code>碎片</code>。</p>
+</li>
+<li>
+<p><code>InnoDB</code>使用了许多<code>链表</code>来管理<code>Buffer Pool</code>。</p>
+</li>
+<li>
+<p><code>free链表</code>中每一个节点都代表一个空闲的缓存页，在将磁盘中的页加载到<code>Buffer Pool</code>时，会从<code>free链表</code>中寻找空闲的缓存页。</p>
+</li>
+<li>
+<p>为了快速定位某个页是否被加载到<code>Buffer Pool</code>，使用<code>表空间号 + 页号</code>作为<code>key</code>，缓存页作为<code>value</code>，建立哈希表。</p>
+</li>
+<li>
+<p>在<code>Buffer Pool</code>中被修改的页称为<code>脏页</code>，脏页并不是立即刷新，而是被加入到<code>flush链表</code>中，待之后的某个时刻同步到磁盘上。</p>
+</li>
+<li>
+<p><code>LRU链表</code>分为<code>young</code>和<code>old</code>两个区域，可以通过<code>innodb_old_blocks_pct</code>来调节<code>old</code>区域所占的比例。首次从磁盘上加载到<code>Buffer Pool</code>的页会被放到<code>old</code>区域的头部，在<code>innodb_old_blocks_time</code>间隔时间内访问该页不会把它移动到<code>young</code>区域头部。在<code>Buffer Pool</code>没有可用的空闲缓存页时，会首先淘汰掉<code>old</code>区域的一些页。</p>
+</li>
+<li>
+<p>我们可以通过指定<code>innodb_buffer_pool_instances</code>来控制<code>Buffer Pool</code>实例的个数，每个<code>Buffer Pool</code>实例中都有各自独立的链表，互不干扰。</p>
+</li>
+<li>
+<p>自<code>MySQL 5.7.5</code>版本之后，可以在服务器运行过程中调整<code>Buffer Pool</code>大小。每个<code>Buffer Pool</code>实例由若干个<code>chunk</code>组成，每个<code>chunk</code>的大小可以在服务器启动时通过启动参数调整。</p>
+</li>
+<li>
+<p>可以用下边的命令查看<code>Buffer Pool</code>的状态信息：</p>
+<pre><code class="hljs bash" lang="bash">SHOW ENGINE INNODB STATUS\G
+</code></pre></li>
+</ol>

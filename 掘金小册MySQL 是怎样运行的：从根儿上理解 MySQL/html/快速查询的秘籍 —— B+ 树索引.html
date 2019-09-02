@@ -1,0 +1,427 @@
+<h1 class="heading">B+树索引</h1>
+<p>标签： MySQL是怎样运行的</p>
+<hr>
+<p>前边我们详细唠叨了<code>InnoDB</code>数据页的7个组成部分，知道了各个数据页可以组成一个<code>双向链表</code>，而每个数据页中的记录会按照主键值从小到大的顺序组成一个<code>单向链表</code>，每个数据页都会为存储在它里边儿的记录生成一个<code>页目录</code>，在通过主键查找某条记录的时候可以在<code>页目录</code>中使用二分法快速定位到对应的槽，然后再遍历该槽对应分组中的记录即可快速找到指定的记录（如果你对这段话有一丁点儿疑惑，那么接下来的部分不适合你，返回去看一下数据页结构吧）。页和记录的关系示意图如下：</p>
+<p></p><figure><img alt="image_1cov976plf2u1j3g1jp8serjc616.png-87.7kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a904b33284?w=1092&amp;h=340&amp;f=png&amp;s=89754"><figcaption></figcaption></figure><p></p>
+<p>其中页a、页b、页c ... 页n 这些页可以不在物理结构上相连，只要通过双向链表相关联即可。</p>
+<h2 class="heading">没有索引的查找</h2>
+<p>本集的主题是<code>索引</code>，在正式介绍<code>索引</code>之前，我们需要了解一下没有索引的时候是怎么查找记录的。为了方便大家理解，我们下边先只唠叨搜索条件为对某个列精确匹配的情况，所谓精确匹配，就是搜索条件中用等于<code>=</code>连接起的表达式，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">SELECT [列名列表] FROM 表名 WHERE 列名 = xxx;
+</code></pre><h3 class="heading">在一个页中的查找</h3>
+<p>假设目前表中的记录比较少，所有的记录都可以被存放到一个页中，在查找记录的时候可以根据搜索条件的不同分为两种情况：</p>
+<ul>
+<li>
+<p>以主键为搜索条件</p>
+<p>这个查找过程我们已经很熟悉了，可以在<code>页目录</code>中使用二分法快速定位到对应的槽，然后再遍历该槽对应分组中的记录即可快速找到指定的记录。</p>
+</li>
+<li>
+<p>以其他列作为搜索条件</p>
+<p>对非主键列的查找的过程可就不这么幸运了，因为在数据页中并没有对非主键列建立所谓的<code>页目录</code>，所以我们无法通过二分法快速定位相应的<code>槽</code>。这种情况下只能从<code>最小记录</code>开始依次遍历单链表中的每条记录，然后对比每条记录是不是符合搜索条件。很显然，这种查找的效率是非常低的。</p>
+</li>
+</ul>
+<h3 class="heading">在很多页中查找</h3>
+<p>大部分情况下我们表中存放的记录都是非常多的，需要好多的数据页来存储这些记录。在很多页中查找记录的话可以分为两个步骤：</p>
+<ol>
+<li>定位到记录所在的页。</li>
+<li>从所在的页内中查找相应的记录。</li>
+</ol>
+<p>在没有索引的情况下，不论是根据主键列或者其他列的值进行查找，<span style="color:red">由于我们并不能快速的定位到记录所在的页，所以只能从第一个页沿着双向链表一直往下找，在每一个页中根据我们刚刚唠叨过的查找方式去查找指定的记录</span>。因为要遍历所有的数据页，所以这种方式显然是超级耗时的，如果一个表有一亿条记录，使用这种方式去查找记录那要等到猴年马月才能等到查找结果。所以祖国和人民都在期盼一种能高效完成搜索的方法，<code>索引</code>同志就要亮相登台了。</p>
+<h2 class="heading">索引</h2>
+<p>为了故事的顺利发展，我们先建一个表：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; CREATE TABLE index_demo(
+    -&gt;     c1 INT,
+    -&gt;     c2 INT,
+    -&gt;     c3 CHAR(1),
+    -&gt;     PRIMARY KEY(c1)
+    -&gt; ) ROW_FORMAT = Compact;
+Query OK, 0 rows affected (0.03 sec)
+</code></pre><p>这个新建的<code>index_demo</code>表中有2个<code>INT</code>类型的列，1个<code>CHAR(1)</code>类型的列，而且我们规定了<code>c1</code>列为主键，这个表使用<code>Compact</code>行格式来实际存储记录的。为了我们理解上的方便，我们简化了一下<code>index_demo</code>表的行格式示意图：</p>
+<p></p><figure><img alt="image_1caac8jr7hhcld017gd1lch1n1m33.png-97.1kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a904d072c4?w=1053&amp;h=410&amp;f=png&amp;s=99439"><figcaption></figcaption></figure><p></p>
+<p>我们只在示意图里展示记录的这几个部分：</p>
+<ul>
+<li>
+<p><code>record_type</code>：记录头信息的一项属性，表示记录的类型，<code>0</code>表示普通记录、<code>2</code>表示最小记录、<code>3</code>表示最大记录、<code>1</code>我们还没用过，等会再说～</p>
+</li>
+<li>
+<p><code>next_record</code>：记录头信息的一项属性，表示下一条地址相对于本条记录的地址偏移量，为了方便大家理解，我们都会用箭头来表明下一条记录是谁。</p>
+</li>
+<li>
+<p><code>各个列的值</code>：这里只记录在<code>index_demo</code>表中的三个列，分别是<code>c1</code>、<code>c2</code>和<code>c3</code>。</p>
+</li>
+<li>
+<p><code>其他信息</code>：除了上述3种信息以外的所有信息，包括其他隐藏列的值以及记录的额外信息。</p>
+</li>
+</ul>
+<p>为了节省篇幅，我们之后的示意图中会把记录的<code>其他信息</code>这个部分省略掉，因为它占地方并且不会有什么观赏效果。另外，为了方便理解，我们觉得把记录竖着放看起来感觉更好，所以将记录格式示意图的<code>其他信息</code>去掉并把它竖起来的效果就是这样：</p>
+<p></p><figure><img alt="image_1caacokob6ne1nv41meda0s7vk3g.png-68.1kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9051511d9?w=642&amp;h=471&amp;f=png&amp;s=69741"><figcaption></figcaption></figure><p></p>
+<p>把一些记录放到页里边的示意图就是：</p>
+<p></p><figure><img alt="image_1caadhc4g1pb7hk81fcd4vt1u6r3t.png-79.8kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a90612d9f7?w=969&amp;h=517&amp;f=png&amp;s=81754"><figcaption></figcaption></figure><p></p>
+<h3 class="heading">一个简单的索引方案</h3>
+<p>回到正题，我们在根据某个搜索条件查找一些记录时为什么要遍历所有的数据页呢？<span style="color:red">因为各个页中的记录并没有规律，我们并不知道我们的搜索条件匹配哪些页中的记录，所以 <em><strong>不得不</strong></em> 依次遍历所有的数据页</span>。所以如果我们想快速的定位到需要查找的记录在哪些数据页中该咋办？还记得我们为根据主键值快速定位一条记录在页中的位置而设立的页目录么？我们也可以想办法为快速定位记录所在的数据页而建立一个别的目录，建这个目录必须完成下边这些事儿：</p>
+<ul>
+<li>
+<p>下一个数据页中用户记录的主键值必须大于上一个页中用户记录的主键值。</p>
+<p>为了故事的顺利发展，我们这里需要做一个假设：假设我们的每个数据页最多能存放3条记录（实际上一个数据页非常大，可以存放下好多记录）。有了这个假设之后我们向<code>index_demo</code>表插入3条记录：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; INSERT INTO index_demo VALUES(1, 4, <span class="hljs-string">'u'</span>), (3, 9, <span class="hljs-string">'d'</span>), (5, 3, <span class="hljs-string">'y'</span>);
+Query OK, 3 rows affected (0.01 sec)
+Records: 3  Duplicates: 0  Warnings: 0
+</code></pre><p>那么这些记录已经按照主键值的大小串联成一个单向链表了，如图所示：</p>
+<p></p><figure><img alt="image_1caaf26411d51bq7jtrvesr04a.png-29.5kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9071559ed?w=507&amp;h=399&amp;f=png&amp;s=30170"><figcaption></figcaption></figure><p></p>
+<p>从图中可以看出来，<code>index_demo</code>表中的3条记录都被插入到了编号为<code>10</code>的数据页中了。此时我们再来插入一条记录：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; INSERT INTO index_demo VALUES(4, 4, <span class="hljs-string">'a'</span>);
+Query OK, 1 row affected (0.00 sec)
+</code></pre><p>因为<code>页10</code>最多只能放3条记录，所以我们<span style="color:red">不得不</span>再分配一个新页：</p>
+<p></p><figure><img alt="image_1caafbcj1qpo1ad2j8q1ci4136s4n.png-44.5kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a908527d1a?w=876&amp;h=397&amp;f=png&amp;s=45569"><figcaption></figcaption></figure><p></p>
+<p>咦？怎么分配的页号是<code>28</code>呀，不应该是<code>11</code>么？再次强调一遍，<span style="color:red">新分配的数据页编号可能并不是连续的，也就是说我们使用的这些页在存储空间里可能并不挨着</span>。它们只是通过维护着上一个页和下一个页的编号而建立了链表关系。另外，<code>页10</code>中用户记录最大的主键值是<code>5</code>，而<code>页28</code>中有一条记录的主键值是<code>4</code>，因为<code>5 &gt; 4</code>，所以这就不符合<span style="color:red">下一个数据页中用户记录的主键值必须大于上一个页中用户记录的主键值</span>的要求，所以在插入主键值为<code>4</code>的记录的时候需要伴随着一次记录移动，也就是把主键值为<code>5</code>的记录移动到<code>页28</code>中，然后再把主键值为<code>4</code>的记录插入到<code>页10</code>中，这个过程的示意图如下：</p>
+<p></p><figure><img alt="image_1caafkq3h1akv1mde14h2kjul6554.png-96.9kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a934270ad1?w=880&amp;h=565&amp;f=png&amp;s=99219"><figcaption></figcaption></figure><p></p>
+<p>这个过程表明了在对页中的记录进行增删改操作的过程中，我们必须通过一些诸如记录移动的操作来始终保证这个状态一直成立：<span style="color:red">下一个数据页中用户记录的主键值必须大于上一个页中用户记录的主键值</span>。这个过程我们也可以称为<code>页分裂</code>。</p>
+</li>
+<li>
+<p>给所有的页建立一个目录项。</p>
+<p>由于<span style="color:red">数据页的编号可能并不是连续的</span>，所以在向<code>index_demo</code>表中插入许多条记录后，可能是这样的效果：</p>
+<p></p><figure><img alt="image_1cab9u9midn61fgq1mi58j0gadm.png-65.7kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9343577b3?w=1146&amp;h=267&amp;f=png&amp;s=67255"><figcaption></figcaption></figure><p></p>
+<p>因为这些<code>16KB</code>的页在物理存储上可能并不挨着，所以如果想从这么多页中根据主键值快速定位某些记录所在的页，我们需要给它们做个目录，<span style="color:red">每个页对应一个目录项</span>，每个目录项包括下边两个部分：</p>
+<ul>
+<li>页的用户记录中最小的主键值，我们用<code>key</code>来表示。</li>
+<li>页号，我们用<code>page_no</code>表示。</li>
+</ul>
+<p>所以我们为上边几个页做好的目录就像这样子：</p>
+<p></p><figure><img alt="image_1caba0afo11fa1cli1nu070m16bg1j.png-119.1kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a93e0c8dfe?w=1098&amp;h=573&amp;f=png&amp;s=121929"><figcaption></figcaption></figure><p></p>
+<p>以<code>页28</code>为例，它对应<code>目录项2</code>，这个目录项中包含着该页的页号<code>28</code>以及该页中用户记录的最小主键值<code>5</code>。我们只需要把几个目录项在物理存储器上连续存储，比如把他们放到一个数组里，就可以实现<span style="color:red">根据主键值</span>快速查找某条记录的功能了。比方说我们想找主键值为<code>20</code>的记录，具体查找过程分两步：</p>
+<ol>
+<li>先从目录项中根据二分法快速确定出主键值为<code>20</code>的记录在<code>目录项3</code>中（因为 <code>12 &lt; 20 &lt; 209</code>），它对应的页是<code>页9</code>。</li>
+<li>再根据前边说的在页中查找记录的方式去<code>页9</code>中定位具体的记录。</li>
+</ol>
+</li>
+</ul>
+<p>至此，针对数据页做的简易目录就搞定了。不过忘了说了，这个<code>目录</code>有一个别名，称为<code>索引</code>。</p>
+<h3 class="heading">InnoDB中的索引方案</h3>
+<p>上边之所以称为一个简易的索引方案，是因为我们为了在根据主键值进行查找时使用二分法快速定位具体的目录项而假设所有目录项都可以在物理存储器上连续存储，但是这样做有几个问题：</p>
+<ul>
+<li>
+<p><code>InnoDB</code>是使用页来作为管理存储空间的基本单位，也就是最多能保证<code>16KB</code>的连续存储空间，而随着表中记录数量的增多，需要非常大的连续的存储空间才能把所有的目录项都放下，这对记录数量非常多的表是不现实的。</p>
+</li>
+<li>
+<p>我们时常会对记录进行增删，假设我们把<code>页28</code>中的记录都删除了，<code>页28</code>也就没有存在的必要了，那意味着<code>目录项2</code>也就没有存在的必要了，这就需要把<code>目录项2</code>后的目录项都向前移动一下，这种牵一发而动全身的设计不是什么好主意～</p>
+</li>
+</ul>
+<p>所以，设计<code>InnoDB</code>的大叔们需要一种可以灵活管理所有<code>目录项</code>的方式。他们灵光乍现，忽然发现这些<code>目录项</code>其实长得跟我们的用户记录差不多，只不过<code>目录项</code>中的两个列是<code>主键</code>和<code>页号</code>而已，所以他们<span style="color:red">复用了之前存储用户记录的数据页来存储目录项，为了和用户记录做一下区分，我们把这些用来表示目录项的记录称为<code>目录项记录</code></span>。那<code>InnoDB</code>怎么区分一条记录是普通的<code>用户记录</code>还是<code>目录项记录</code>呢？别忘了记录头信息里的<code>record_type</code>属性，它的各个取值代表的意思如下：</p>
+<ul>
+<li><code>0</code>：普通的用户记录</li>
+<li><code>1</code>：目录项记录</li>
+<li><code>2</code>：最小记录</li>
+<li><code>3</code>：最大记录</li>
+</ul>
+<p>哈哈，原来这个值为<code>1</code>的<code>record_type</code>是这个意思呀，我们把前边使用到的目录项放到数据页中的样子就是这样：</p>
+<p></p><figure><img alt="image_1caahuomf15m11e5k19v1bf21inq9.png-145.9kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a93e14c7be?w=1178&amp;h=535&amp;f=png&amp;s=149447"><figcaption></figcaption></figure><p></p>
+<p>从图中可以看出来，我们新分配了一个编号为<code>30</code>的页来专门存储<code>目录项记录</code>。这里再次强调一遍<code>目录项记录</code>和普通的<code>用户记录</code>的不同点：</p>
+<ul>
+<li>
+<p><code>目录项记录</code>的<code>record_type</code>值是1，而普通用户记录的<code>record_type</code>值是0。</p>
+</li>
+<li>
+<p><code>目录项记录</code>只有主键值和页的编号两个列，而普通的用户记录的列是用户自己定义的，可能包含很多列，另外还有<code>InnoDB</code>自己添加的隐藏列。</p>
+</li>
+<li>
+<p>还记得我们之前在唠叨记录头信息的时候说过一个叫<code>min_rec_mask</code>的属性么，只有在存储<code>目录项记录</code>的页中的主键值最小的<code>目录项记录</code>的<code>min_rec_mask</code>值为<code>1</code>，其他别的记录的<code>min_rec_mask</code>值都是<code>0</code>。</p>
+</li>
+</ul>
+<p>除了上述几点外，这两者就没啥差别了，它们用的是一样的数据页（页面类型都是<code>0x45BF</code>，这个属性在<code>File Header</code>中，忘了的话可以翻到前边的文章看），页的组成结构也是一样一样的（就是我们前边介绍过的7个部分），都会为主键值生成<code>Page Directory</code>（页目录），从而在按照主键值进行查找时可以使用二分法来加快查询速度。现在以查找主键为<code>20</code>的记录为例，根据某个主键值去查找记录的步骤就可以大致拆分成下边两步：</p>
+<ol>
+<li>
+<p>先到存储<code>目录项记录</code>的页，也就是页<code>30</code>中通过二分法快速定位到对应目录项，因为<code>12 &lt; 20 &lt; 209</code>，所以定位到对应的记录所在的页就是<code>页9</code>。</p>
+</li>
+<li>
+<p>再到存储用户记录的<code>页9</code>中根据二分法快速定位到主键值为<code>20</code>的用户记录。</p>
+</li>
+</ol>
+<p>虽然说<code>目录项记录</code>中<span style="color:red">只存储主键值和对应的页号</span>，比用户记录需要的存储空间小多了，但是不论怎么说一个页只有<code>16KB</code>大小，能存放的<code>目录项记录</code>也是有限的，那如果表中的数据太多，以至于一个数据页不足以存放所有的<code>目录项记录</code>，该咋办呢？</p>
+<p>当然是再多整一个存储<code>目录项记录</code>的页喽～ 为了大家更好的理解新分配一个<code>目录项记录</code>页的过程，我们假设一个存储<code>目录项记录</code>的页最多只能存放4条<code>目录项记录</code>（请注意是假设哦，真实情况下可以存放好多条的），所以如果此时我们再向上图中插入一条主键值为<code>320</code>的用户记录的话，那就需要分配一个新的存储<code>目录项记录</code>的页喽：</p>
+<p></p><figure><img alt="image_1cacabsrh17a5133q1otf725gi92q.png-135.7kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a93f82e166?w=1181&amp;h=472&amp;f=png&amp;s=138985"><figcaption></figcaption></figure><p></p>
+<p>从图中可以看出，我们插入了一条主键值为<code>320</code>的用户记录之后需要两个新的数据页：</p>
+<ul>
+<li>
+<p>为存储该用户记录而新生成了<code>页31</code>。</p>
+</li>
+<li>
+<p>因为原先存储<code>目录项记录</code>的<code>页30</code>的容量已满（我们前边假设只能存储4条<code>目录项记录</code>），所以不得不需要一个新的<code>页32</code>来存放<code>页31</code>对应的目录项。</p>
+</li>
+</ul>
+<p>现在因为存储<code>目录项记录</code>的页不止一个，所以如果我们想根据主键值查找一条用户记录大致需要3个步骤，以查找主键值为<code>20</code>的记录为例：</p>
+<ol>
+<li>
+<p>确定<code>目录项记录</code>页</p>
+<p>我们现在的存储<code>目录项记录</code>的页有两个，即<code>页30</code>和<code>页32</code>，又因为<code>页30</code>表示的目录项的主键值的范围是<code>[1, 320)</code>，<code>页32</code>表示的目录项的主键值不小于<code>320</code>，所以主键值为<code>20</code>的记录对应的目录项记录在<code>页30</code>中。</p>
+</li>
+<li>
+<p>通过<code>目录项记录</code>页确定用户记录真实所在的页。</p>
+<p>在一个存储<code>目录项记录</code>的页中通过主键值定位一条目录项记录的方式说过了，不赘述了～</p>
+</li>
+<li>
+<p>在真实存储用户记录的页中定位到具体的记录。</p>
+<p>在一个存储用户记录的页中通过主键值定位一条用户记录的方式已经说过200遍了，你再不会我就，我就，我就求你到上一篇唠叨数据页结构的文章中多看几遍，求你了～</p>
+</li>
+</ol>
+<p>那么问题来了，在这个查询步骤的第1步中我们需要定位存储<code>目录项记录</code>的页，但是这些页在存储空间中也可能不挨着，如果我们表中的数据非常多则会产生很多存储<code>目录项记录</code>的页，那我们怎么根据主键值快速定位一个存储<code>目录项记录</code>的页呢？其实也简单，为这些存储<code>目录项记录</code>的页再生成一个更高级的目录，就像是一个多级目录一样，大目录里嵌套小目录，小目录里才是实际的数据，所以现在各个页的示意图就是这样子：</p>
+<p></p><figure><img alt="image_1cacafpso19vpkik1j5rtrd17cm3a.png-158.1kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9496cd230?w=1080&amp;h=579&amp;f=png&amp;s=161941"><figcaption></figcaption></figure><p></p>
+<p>如图，我们生成了一个存储更高级目录项的<code>页33</code>，这个页中的两条记录分别代表<code>页30</code>和<code>页32</code>，如果用户记录的主键值在<code>[1, 320)</code>之间，则到<code>页30</code>中查找更详细的<code>目录项记录</code>，如果主键值不小于<code>320</code>的话，就到<code>页32</code>中查找更详细的<code>目录项记录</code>。不过这张图好漂亮喔，随着表中记录的增加，这个目录的层级会继续增加，如果简化一下，那么我们可以用下边这个图来描述它：</p>
+<p></p><figure><img alt="image_1ca80gps314u9121u1rdp9r7md8cm.png-55.6kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a961cd3016?w=1136&amp;h=533&amp;f=png&amp;s=56890"><figcaption></figcaption></figure><p></p>
+<p>这玩意儿像不像一个倒过来的<code>树</code>呀，上头是树根，下头是树叶！其实这是一种组织数据的形式，或者说是一种数据结构，它的名称是<code>B+</code>树。</p>
+<blockquote class="warning"><p>小贴士：
+
+为啥叫`B+`呢，`B`树是个啥？喔对不起，这不是我们讨论的范围，你可以去找一本数据结构或算法的书来看。什么？数据结构的书看不懂？等我～
+</p></blockquote><p>不论是存放用户记录的数据页，还是存放目录项记录的数据页，我们都把它们存放到<code>B+</code>树这个数据结构中了，所以我们也称这些数据页为<code>节点</code>。从图中可以看出来，我们的<span style="color:red">实际用户记录其实都存放在B+树的最底层的节点上</span>，这些节点也被称为<code>叶子节点</code>或<code>叶节点</code>，其余用来存放<code>目录项</code>的节点称为<code>非叶子节点</code>或者<code>内节点</code>，其中<code>B+</code>树最上边的那个节点也称为<code>根节点</code>。</p>
+<p>从图中可以看出来，一个<code>B+</code>树的节点其实可以分成好多层，设计<code>InnoDB</code>的大叔们为了讨论方便，规定最下边的那层，也就是存放我们用户记录的那层为第<code>0</code>层，之后依次往上加。之前的讨论我们做了一个非常极端的假设：存放用户记录的页最多存放3条记录，存放目录项记录的页最多存放4条记录。其实真实环境中一个页存放的记录数量是非常大的，假设，假设，假设所有存放用户记录的叶子节点代表的数据页可以存放100条用户记录，所有存放目录项记录的内节点代表的数据页可以存放1000条目录项记录，那么：</p>
+<ul>
+<li>
+<p>如果<code>B+</code>树只有1层，也就是只有1个用于存放用户记录的节点，最多能存放<code>100</code>条记录。</p>
+</li>
+<li>
+<p>如果<code>B+</code>树有2层，最多能存放<code>1000×100=100000</code>条记录。</p>
+</li>
+<li>
+<p>如果<code>B+</code>树有3层，最多能存放<code>1000×1000×100=100000000</code>条记录。</p>
+</li>
+<li>
+<p>如果<code>B+</code>树有4层，最多能存放<code>1000×1000×1000×100=100000000000</code>条记录。哇咔咔～这么多的记录！！！</p>
+</li>
+</ul>
+<p>你的表里能存放<code>100000000000</code>条记录么？所以一般情况下，我们用到的<code>B+</code>树都不会超过4层，那我们通过主键值去查找某条记录最多只需要做4个页面内的查找（查找3个目录项页和一个用户记录页），又因为在每个页面内有所谓的<code>Page Directory</code>（页目录），所以在页面内也可以通过二分法实现快速定位记录，这不是很牛么，哈哈！</p>
+<h4 class="heading">聚簇索引</h4>
+<p>我们上边介绍的<code>B+</code>树本身就是一个目录，或者说本身就是一个索引。它有两个特点：</p>
+<ol>
+<li>
+<p>使用记录主键值的大小进行记录和页的排序，这包括三个方面的含义：</p>
+<ul>
+<li>
+<p>页内的记录是按照主键的大小顺序排成一个单向链表。</p>
+</li>
+<li>
+<p>各个存放用户记录的页也是根据页中用户记录的主键大小顺序排成一个双向链表。</p>
+</li>
+<li>
+<p>存放目录项记录的页分为不同的层次，在同一层次中的页也是根据页中目录项记录的主键大小顺序排成一个双向链表。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><code>B+</code>树的叶子节点存储的是完整的用户记录。</p>
+<p>所谓完整的用户记录，就是指这个记录中存储了所有列的值（包括隐藏列）。</p>
+</li>
+</ol>
+<p>我们把具有这两种特性的<code>B+</code>树称为<code>聚簇索引</code>，所有完整的用户记录都存放在这个<code>聚簇索引</code>的叶子节点处。这种<code>聚簇索引</code>并不需要我们在<code>MySQL</code>语句中显式的使用<code>INDEX</code>语句去创建（后边会介绍索引相关的语句），<code>InnoDB</code>存储引擎会<span style="color:red">自动的为我们创建聚簇索引</span>。另外有趣的一点是，在<code>InnoDB</code>存储引擎中，<code>聚簇索引</code>就是数据的存储方式（所有的用户记录都存储在了<code>叶子节点</code>），也就是所谓的<span style="color:red">索引即数据，数据即索引</span>。</p>
+<h4 class="heading">二级索引</h4>
+<p>大家有木有发现，上边介绍的<code>聚簇索引</code>只能在搜索条件是主键值时才能发挥作用，因为<code>B+</code>树中的数据都是按照主键进行排序的。那如果我们想以别的列作为搜索条件该咋办呢？难道只能从头到尾沿着链表依次遍历记录么？</p>
+<p>不，我们可以多建几棵<code>B+</code>树，不同的<code>B+</code>树中的数据采用不同的排序规则。比方说我们用<code>c2</code>列的大小作为数据页、页中记录的排序规则，再建一棵<code>B+</code>树，效果如下图所示：</p>
+<p></p><figure><img alt="image_1cactc8jg14j91likvmd1h8cn3o4h.png-161.6kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a961fd74e7?w=1112&amp;h=586&amp;f=png&amp;s=165483"><figcaption></figcaption></figure><p></p>
+<p>这个<code>B+</code>树与上边介绍的聚簇索引有几处不同：</p>
+<ul>
+<li>
+<p>使用记录<code>c2</code>列的大小进行记录和页的排序，这包括三个方面的含义：</p>
+<ul>
+<li>
+<p>页内的记录是按照<code>c2</code>列的大小顺序排成一个单向链表。</p>
+</li>
+<li>
+<p>各个存放用户记录的页也是根据页中记录的<code>c2</code>列大小顺序排成一个双向链表。</p>
+</li>
+<li>
+<p>存放目录项记录的页分为不同的层次，在同一层次中的页也是根据页中目录项记录的<code>c2</code>列大小顺序排成一个双向链表。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><code>B+</code>树的叶子节点存储的并不是完整的用户记录，而只是<code>c2列+主键</code>这两个列的值。</p>
+</li>
+<li>
+<p>目录项记录中不再是<code>主键+页号</code>的搭配，而变成了<code>c2列+页号</code>的搭配。</p>
+</li>
+</ul>
+<p>所以如果我们现在想通过<code>c2</code>列的值查找某些记录的话就可以使用我们刚刚建好的这个<code>B+</code>树了。以查找<code>c2</code>列的值为<code>4</code>的记录为例，查找过程如下：</p>
+<ol>
+<li>
+<p>确定<code>目录项记录</code>页</p>
+<p>根据<code>根页面</code>，也就是<code>页44</code>，可以快速定位到<code>目录项记录</code>所在的页为<code>页42</code>（因为<code>2 &lt; 4 &lt; 9</code>）。</p>
+</li>
+<li>
+<p>通过<code>目录项记录</code>页确定用户记录真实所在的页。</p>
+<p>在<code>页42</code>中可以快速定位到实际存储用户记录的页，但是由于<code>c2</code>列并没有唯一性约束，所以<code>c2</code>列值为<code>4</code>的记录可能分布在多个数据页中，又因为<code>2 &lt; 4 ≤ 4</code>，所以确定实际存储用户记录的页在<code>页34</code>和<code>页35</code>中。</p>
+</li>
+<li>
+<p>在真实存储用户记录的页中定位到具体的记录。</p>
+<p>到<code>页34</code>和<code>页35</code>中定位到具体的记录。</p>
+</li>
+<li>
+<p>但是这个<code>B+</code>树的叶子节点中的记录只存储了<code>c2</code>和<code>c1</code>（也就是<code>主键</code>）两个列，所以<span style="color:red">我们必须再根据主键值去聚簇索引中再查找一遍完整的用户记录</span>。</p>
+</li>
+</ol>
+<p>各位各位，看到步骤4的操作了么？我们根据这个以<code>c2</code>列大小排序的<code>B+</code>树只能确定我们要查找记录的主键值，所以如果我们想根据<code>c2</code>列的值查找到完整的用户记录的话，仍然需要到<code>聚簇索引</code>中再查一遍，这个过程也被称为<code>回表</code>。也就是根据<code>c2</code>列的值查询一条完整的用户记录需要使用到<code>2</code>棵<code>B+</code>树！！！</p>
+<p>为什么我们还需要一次<code>回表</code>操作呢？直接把完整的用户记录放到<code>叶子节点</code>不就好了么？你说的对，如果把完整的用户记录放到<code>叶子节点</code>是可以不用<code>回表</code>，但是太占地方了呀～相当于每建立一棵<code>B+</code>树都需要把所有的用户记录再都拷贝一遍，这就有点太浪费存储空间了。因为这种按照<code>非主键列</code>建立的<code>B+</code>树需要一次<code>回表</code>操作才可以定位到完整的用户记录，所以这种<code>B+</code>树也被称为<code>二级索引</code>（英文名<code>secondary index</code>），或者<code>辅助索引</code>。由于我们使用的是<code>c2</code>列的大小作为<code>B+</code>树的排序规则，所以我们也称这个<code>B+</code>树为<span style="color:red">为c2列建立的索引</span>。</p>
+<h5 class="heading">联合索引</h5>
+<p>我们也可以同时以多个列的大小作为排序规则，也就是同时为多个列建立索引，比方说我们想让<code>B+</code>树按照<code>c2</code>和<code>c3</code>列的大小进行排序，这个包含两层含义：</p>
+<ul>
+<li>先把各个记录和页按照<code>c2</code>列进行排序。</li>
+<li>在记录的<code>c2</code>列相同的情况下，采用<code>c3</code>列进行排序</li>
+</ul>
+<p>为<code>c2</code>和<code>c3</code>列建立的索引的示意图如下：</p>
+<p></p><figure><img alt="image_1cacvu3hmlr9m501r6b1809uo35o.png-165.1kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9661391c4?w=1106&amp;h=584&amp;f=png&amp;s=169103"><figcaption></figcaption></figure><p></p>
+<p>如图所示，我们需要注意一下几点：</p>
+<ul>
+<li>
+<p>每条<code>目录项记录</code>都由<code>c2</code>、<code>c3</code>、<code>页号</code>这三个部分组成，各条记录先按照<code>c2</code>列的值进行排序，如果记录的<code>c2</code>列相同，则按照<code>c3</code>列的值进行排序。</p>
+</li>
+<li>
+<p><code>B+</code>树叶子节点处的用户记录由<code>c2</code>、<code>c3</code>和主键<code>c1</code>列组成。</p>
+</li>
+</ul>
+<p>千万要注意一点，<span style="color:red">以c2和c3列的大小为排序规则建立的<code>B+</code>树称为<code>联合索引</code>，它的意思与分别为c2和c3列分别建立索引的表述是不同的</span>，不同点如下：</p>
+<ul>
+<li>
+<p>建立<code>联合索引</code>只会建立如上图一样的1棵<code>B+</code>树。</p>
+</li>
+<li>
+<p>为c2和c3列分别建立索引会分别以<code>c2</code>和<code>c3</code>列的大小为排序规则建立2棵<code>B+</code>树。</p>
+</li>
+</ul>
+<h3 class="heading">InnoDB的B+树索引的注意事项</h3>
+<h4 class="heading">根页面万年不动窝</h4>
+<p>我们前边介绍<code>B+</code>树索引的时候，为了大家理解上的方便，先把存储用户记录的叶子节点都画出来，然后接着画存储目录项记录的内节点，实际上<code>B+</code>树的形成过程是这样的：</p>
+<ul>
+<li>
+<p>每当为某个表创建一个<code>B+</code>树索引（聚簇索引不是人为创建的，默认就有）的时候，都会为这个索引创建一个<code>根节点</code>页面。最开始表中没有数据的时候，每个<code>B+</code>树索引对应的<code>根节点</code>中既没有用户记录，也没有目录项目录。</p>
+</li>
+<li>
+<p>随后向表中插入用户记录时，先把用户记录存储到这个<code>根节点</code>中。</p>
+</li>
+<li>
+<p>当<code>根节点</code>中的可用空间用完时继续插入记录，此时会将<code>根节点</code>中的所有记录复制到一个新分配的页，比如<code>页a</code>中，然后对这个新页进行<code>页分裂</code>的操作，得到另一个新页，比如<code>页b</code>。这时新插入的记录根据键值（也就是聚簇索引中的主键值，二级索引中对应的索引列的值）的大小就会被分配到<code>页a</code>或者<code>页b</code>中，而<code>根节点</code>便升级为存储目录项记录的页。</p>
+</li>
+</ul>
+<p>这个过程需要大家特别注意的是：<span style="color:red">一个B+树索引的根节点自诞生之日起，便不会再移动</span>。这样只要我们对某个表建立一个索引，那么它的<code>根节点</code>的页号便会被记录到某个地方，然后凡是<code>InnoDB</code>存储引擎需要用到这个索引的时候，都会从那个固定的地方取出<code>根节点</code>的页号，从而来访问这个索引。</p>
+<blockquote class="warning"><p>小贴士：
+
+跟大家剧透一下，这个存储某个索引的根节点在哪个页面中的信息就是传说中的数据字典中的一项信息，关于更多数据字典的内容，后边会详细唠叨，别着急哈。
+</p></blockquote><h4 class="heading">内节点中目录项记录的唯一性</h4>
+<p>我们知道<code>B+</code>树索引的内节点中目录项记录的内容是<code>索引列 + 页号</code>的搭配，但是这个搭配对于二级索引来说有点儿不严谨。还拿<code>index_demo</code>表为例，假设这个表中的数据是这样的：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center"><code>c1</code></th>
+<th style="text-align:center"><code>c2</code></th>
+<th style="text-align:center"><code>c3</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">1</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">'u'</td>
+</tr>
+<tr>
+<td style="text-align:center">3</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">'d'</td>
+</tr>
+<tr>
+<td style="text-align:center">5</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">'y'</td>
+</tr>
+<tr>
+<td style="text-align:center">7</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">'a'</td>
+</tr>
+</tbody>
+</table>
+<p>如果二级索引中目录项记录的内容只是<code>索引列 + 页号</code>的搭配的话，那么为<code>c2</code>列建立索引后的<code>B+</code>树应该长这样：</p>
+<p></p><figure><img alt="image_1cp9vthl71h9n8091dkdjek16qg1j.png-58.6kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a96625ebb1?w=533&amp;h=563&amp;f=png&amp;s=60029"><figcaption></figcaption></figure><p></p>
+<p>如果我们想新插入一行记录，其中<code>c1</code>、<code>c2</code>、<code>c3</code>的值分别是：<code>9</code>、<code>1</code>、<code>'c'</code>，那么在修改这个为<code>c2</code>列建立的二级索引对应的<code>B+</code>树时便碰到了个大问题：由于<code>页3</code>中存储的目录项记录是由<code>c2列 + 页号</code>的值构成的，<code>页3</code>中的两条目录项记录对应的<code>c2</code>列的值都是<code>1</code>，而我们新插入的这条记录的<code>c2</code>列的值也是<code>1</code>，那我们这条新插入的记录到底应该放到<code>页4</code>中，还是应该放到<code>页5</code>中啊？答案是：对不起，懵逼了。</p>
+<p>为了让新插入记录能找到自己在那个页里，<span style="color:red">我们需要保证在B+树的同一层内节点的目录项记录除<code>页号</code>这个字段以外是唯一的</span>。所以对于二级索引的内节点的目录项记录的内容实际上是由三个部分构成的：</p>
+<ul>
+<li>索引列的值</li>
+<li>主键值</li>
+<li>页号</li>
+</ul>
+<p>也就是我们把<code>主键值</code>也添加到二级索引内节点中的目录项记录了，这样就能保证<code>B+</code>树每一层节点中各条目录项记录除<code>页号</code>这个字段外是唯一的，所以我们为<code>c2</code>列建立二级索引后的示意图实际上应该是这样子的：</p>
+<p></p><figure><img alt="image_1cpb919suginpp7lbgsk0147f20.png-58.6kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a97d84ddee?w=536&amp;h=555&amp;f=png&amp;s=60020"><figcaption></figcaption></figure><p></p>
+<p>这样我们再插入记录<code>(9, 1, 'c')</code>时，由于<code>页3</code>中存储的目录项记录是由<code>c2列 + 主键 + 页号</code>的值构成的，可以先把新记录的<code>c2</code>列的值和<code>页3</code>中各目录项记录的<code>c2</code>列的值作比较，如果<code>c2</code>列的值相同的话，可以接着比较主键值，因为<code>B+</code>树同一层中不同目录项记录的<code>c2列 + 主键</code>的值肯定是不一样的，所以最后肯定能定位唯一的一条目录项记录，在本例中最后确定新记录应该被插入到<code>页5</code>中。</p>
+<h4 class="heading">一个页面最少存储2条记录</h4>
+<p>我们前边说过一个B+树只需要很少的层级就可以轻松存储数亿条记录，查询速度杠杠的！这是因为B+树本质上就是一个大的多层级目录，每经过一个目录时都会过滤掉许多无效的子目录，直到最后访问到存储真实数据的目录。那如果一个大的目录中只存放一个子目录是个啥效果呢？那就是目录层级非常非常非常多，而且最后的那个存放真实数据的目录中只能存放一条记录。费了半天劲只能存放一条真实的用户记录？逗我呢？所以<code>InnoDB</code>的一个数据页至少可以存放两条记录，这也是我们之前唠叨记录行格式的时候说过一个结论（我们当时依据这个结论推导了表中只有一个列时该列在不发生行溢出的情况下最多能存储多少字节，忘了的话回去看看吧）。</p>
+<h3 class="heading">MyISAM中的索引方案简单介绍</h3>
+<p>至此，我们介绍的都是<code>InnoDB</code>存储引擎中的索引方案，为了内容的完整性，以及各位可能在面试的时候遇到这类的问题，我们有必要再简单介绍一下<code>MyISAM</code>存储引擎中的索引方案。我们知道<code>InnoDB</code>中<span style="color:red">索引即数据，也就是聚簇索引的那棵<code>B+</code>树的叶子节点中已经把所有完整的用户记录都包含了</span>，而<code>MyISAM</code>的索引方案虽然也使用树形结构，但是却将索引和数据分开存储：</p>
+<ul>
+<li>
+<p>将表中的记录按照记录的插入顺序单独存储在一个文件中，称之为<code>数据文件</code>。这个文件并不划分为若干个数据页，有多少记录就往这个文件中塞多少记录就成了。我们可以通过行号而快速访问到一条记录。</p>
+<p><code>MyISAM</code>记录也需要记录头信息来存储一些额外数据，我们以上边唠叨过的<code>index_demo</code>表为例，看一下这个表中的记录使用<code>MyISAM</code>作为存储引擎在存储空间中的表示：</p>
+<p></p><figure><img alt="image_1cpc7go2o12t1ocd17nvr6msth9.png-58.9kB" src="https://user-gold-cdn.xitu.io/2018/11/30/167627a9871b342f?w=332&amp;h=528&amp;f=png&amp;s=60362"><figcaption></figcaption></figure><p></p>
+<p>由于在插入数据的时候并没有刻意按照主键大小排序，所以我们并不能在这些数据上使用二分法进行查找。</p>
+</li>
+<li>
+<p>使用<code>MyISAM</code>存储引擎的表会把索引信息另外存储到一个称为<code>索引文件</code>的另一个文件中。<code>MyISAM</code>会单独为表的主键创建一个索引，只不过在索引的叶子节点中存储的不是完整的用户记录，而是<code>主键值 + 行号</code>的组合。也就是先通过索引找到对应的行号，再通过行号去找对应的记录！</p>
+<p>这一点和<code>InnoDB</code>是完全不相同的，在<code>InnoDB</code>存储引擎中，我们只需要根据主键值对<code>聚簇索引</code>进行一次查找就能找到对应的记录，而在<code>MyISAM</code>中却需要进行一次<code>回表</code>操作，意味着<span style="color:red"><code>MyISAM</code>中建立的索引相当于全部都是<code>二级索引</code></span>！</p>
+</li>
+<li>
+<p>如果有需要的话，我们也可以对其它的列分别建立索引或者建立联合索引，原理和<code>InnoDB</code>中的索引差不多，不过在叶子节点处存储的是<code>相应的列 + 行号</code>。这些索引也全部都是<code>二级索引</code>。</p>
+</li>
+</ul>
+<blockquote class="warning"><p>小贴士：
+
+MyISAM的行格式有定长记录格式（Static）、变长记录格式（Dynamic）、压缩记录格式（Compressed）。上边用到的index_demo表采用定长记录格式，也就是一条记录占用存储空间的大小是固定的，这样就可以轻松算出某条记录在数据文件中的地址偏移量。但是变长记录格式就不行了，MyISAM会直接在索引叶子节点处存储该条记录在数据文件中的地址偏移量。通过这个可以看出，MyISAM的回表操作是十分快速的，因为是拿着地址偏移量直接到文件中取数据的，反观InnoDB是通过获取主键之后再去聚簇索引里边儿找记录，虽然说也不慢，但还是比不上直接用地址去访问。
+
+此处我们只是非常简要的介绍了一下MyISAM的索引，具体细节全拿出来又可以写一篇文章了。这里只是希望大家理解InnoDB中的索引即数据，数据即索引，而MyISAM中却是索引是索引、数据是数据。
+</p></blockquote><h3 class="heading">MySQL中创建和删除索引的语句</h3>
+<p>光顾着唠叨索引的原理了，那我们如何使用<code>MySQL</code>语句去建立这种索引呢？<code>InnoDB</code>和<code>MyISAM</code>会<span style="color:red">自动</span>为主键或者声明为<code>UNIQUE</code>的列去自动建立<code>B+</code>树索引，但是如果我们想为其他的列建立索引就需要我们显式的去指明。为啥不自动为每个列都建立个索引呢？别忘了，每建立一个索引都会建立一棵<code>B+</code>树，每插入一条记录都要维护各个记录、数据页的排序关系，这是很费性能和存储空间的。</p>
+<p>我们可以在创建表的时候指定需要建立索引的单个列或者建立联合索引的多个列：</p>
+<pre><code class="hljs bash" lang="bash">CREATE TALBE 表名 (
+    各种列的信息 ··· , 
+    [KEY|INDEX] 索引名 (需要被索引的单个列或多个列)
+)
+</code></pre><p>其中的<code>KEY</code>和<code>INDEX</code>是同义词，任意选用一个就可以。我们也可以在修改表结构的时候添加索引：</p>
+<pre><code class="hljs bash" lang="bash">ALTER TABLE 表名 ADD [INDEX|KEY] 索引名 (需要被索引的单个列或多个列);
+</code></pre><p>也可以在修改表结构的时候删除索引：</p>
+<pre><code class="hljs bash" lang="bash">ALTER TABLE 表名 DROP [INDEX|KEY] 索引名;
+</code></pre><p>比方说我们想在创建<code>index_demo</code>表的时候就为<code>c2</code>和<code>c3</code>列添加一个<code>联合索引</code>，可以这么写建表语句：</p>
+<pre><code class="hljs bash" lang="bash">CREATE TABLE index_demo(
+    c1 INT,
+    c2 INT,
+    c3 CHAR(1),
+    PRIMARY KEY(c1),
+    INDEX idx_c2_c3 (c2, c3)
+);
+</code></pre><p>在这个建表语句中我们创建的索引名是<code>idx_c2_c3</code>，这个名称可以随便起，不过我们还是建议以<code>idx_</code>为前缀，后边跟着需要建立索引的列名，多个列名之间用下划线<code>_</code>分隔开。</p>
+<p>如果我们想删除这个索引，可以这么写：</p>
+<pre><code class="hljs bash" lang="bash">ALTER TABLE index_demo DROP INDEX idx_c2_c3;
+</code></pre><h2 class="heading">总结</h2>
+<ol>
+<li>
+<p>对于<code>InnoDB</code>存储引擎来说，在单个页中查找某条记录分为两种情况：</p>
+<ul>
+<li>
+<p>以主键为搜索条件，可以使用<code>Page Directory</code>通过二分法快速定位相应的用户记录。</p>
+</li>
+<li>
+<p>以其他列为搜索条件，需要按照记录组成的单链表依次遍历各条记录。</p>
+</li>
+</ul>
+</li>
+<li>
+<p>没有索引的情况下，不论是以主键还是其他列作为搜索条件，只能沿着页的双链表从左到右依次遍历各个页。</p>
+</li>
+<li>
+<p><code>InnoDB</code>存储引擎的索引是一棵<code>B+</code>树，完整的用户记录都存储在<code>B+</code>树第<code>0</code>层的叶子节点，其他层次的节点都属于<code>内节点</code>，<code>内节点</code>里存储的是<code>目录项记录</code>。<code>InnoDB</code>的索引分为两大种：</p>
+<ul>
+<li>
+<p>聚簇索引</p>
+<p>以主键值的大小为页和记录的排序规则，在叶子节点处存储的记录包含了表中所有的列。</p>
+</li>
+<li>
+<p>二级索引</p>
+<p>以自定义的列的大小为页和记录的排序规则，在叶子节点处存储的记录内容是<code>列 + 主键</code>。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><code>MyISAM</code>存储引擎的数据和索引分开存储，这种存储引擎的索引全部都是<code>二级索引</code>，在叶子节点处存储的是<code>列 + 页号</code>。</p>
+</li>
+</ol>

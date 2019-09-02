@@ -1,0 +1,418 @@
+<h1 class="heading">Explain 详解（下）</h1>
+<p>标签： MySQL 是怎样运行的</p>
+<hr>
+<h2 class="heading">执行计划输出中各列详解</h2>
+<p>本章紧接着上一节的内容，继续唠叨<code>EXPLAIN</code>语句输出的各个列的意思。</p>
+<h3 class="heading">Extra</h3>
+<p>顾名思义，<code>Extra</code>列是用来说明一些额外信息的，我们可以通过这些额外信息来更准确的理解<code>MySQL</code>到底将如何执行给定的查询语句。<code>MySQL</code>提供的额外信息有好几十个，我们就不一个一个介绍了（都介绍了感觉我们的文章就跟文档差不多了～），所以我们只挑一些平时常见的或者比较重要的额外信息介绍给大家哈。</p>
+<ul>
+<li>
+<p><code>No tables used</code></p>
+<p>当查询语句的没有<code>FROM</code>子句时将会提示该额外信息，比如：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT 1;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra          |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+|  1 | SIMPLE      | NULL  | NULL       | NULL | NULL          | NULL | NULL    | NULL | NULL |     NULL | No tables used |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>Impossible WHERE</code></p>
+<p>查询语句的<code>WHERE</code>子句永远为<code>FALSE</code>时将会提示该额外信息，比方说：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE 1 != 1;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra            |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------------+
+|  1 | SIMPLE      | NULL  | NULL       | NULL | NULL          | NULL | NULL    | NULL | NULL |     NULL | Impossible WHERE |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.01 sec)
+</code></pre></li>
+<li>
+<p><code>No matching min/max row</code></p>
+<p>当查询列表处有<code>MIN</code>或者<code>MAX</code>聚集函数，但是并没有符合<code>WHERE</code>子句中的搜索条件的记录时，将会提示该额外信息，比方说：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT MIN(key1) FROM s1 WHERE key1 = <span class="hljs-string">'abcdefg'</span>;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra                   |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------------------+
+|  1 | SIMPLE      | NULL  | NULL       | NULL | NULL          | NULL | NULL    | NULL | NULL |     NULL | No matching min/max row |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>Using index</code></p>
+<p>当我们的查询列表以及搜索条件中只包含属于某个索引的列，也就是在可以使用索引覆盖的情况下，在<code>Extra</code>列将会提示该额外信息。比方说下边这个查询中只需要用到<code>idx_key1</code>而不需要回表操作：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT key1 FROM s1 WHERE key1 = <span class="hljs-string">'a'</span>;
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key      | key_len | ref   | rows | filtered | Extra       |
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | s1    | NULL       | ref  | idx_key1      | idx_key1 | 303     | const |    8 |   100.00 | Using index |
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>Using index condition</code></p>
+<p>有些搜索条件中虽然出现了索引列，但却不能使用到索引，比如下边这个查询：</p>
+<pre><code class="hljs bash" lang="bash">SELECT * FROM s1 WHERE key1 &gt; <span class="hljs-string">'z'</span> AND key1 LIKE <span class="hljs-string">'%a'</span>;
+</code></pre><p>其中的<code>key1 &gt; 'z'</code>可以使用到索引，但是<code>key1 LIKE '%a'</code>却无法使用到索引，在以前版本的<code>MySQL</code>中，是按照下边步骤来执行这个查询的：</p>
+<ul>
+<li>
+<p>先根据<code>key1 &gt; 'z'</code>这个条件，从二级索引<code>idx_key1</code>中获取到对应的二级索引记录。</p>
+</li>
+<li>
+<p>根据上一步骤得到的二级索引记录中的主键值进行回表，找到完整的用户记录再检测该记录是否符合<code>key1 LIKE '%a'</code>这个条件，将符合条件的记录加入到最后的结果集。</p>
+</li>
+</ul>
+<p>但是虽然<code>key1 LIKE '%a'</code>不能组成范围区间参与<code>range</code>访问方法的执行，但这个条件毕竟只涉及到了<code>key1</code>列，所以设计<code>MySQL</code>的大叔把上边的步骤改进了一下：</p>
+<ul>
+<li>
+<p>先根据<code>key1 &gt; 'z'</code>这个条件，定位到二级索引<code>idx_key1</code>中对应的二级索引记录。</p>
+</li>
+<li>
+<p>对于指定的二级索引记录，先不着急回表，而是先检测一下该记录是否满足<code>key1 LIKE '%a'</code>这个条件，如果这个条件不满足，则该二级索引记录压根儿就没必要回表。</p>
+</li>
+<li>
+<p>对于满足<code>key1 LIKE '%a'</code>这个条件的二级索引记录执行回表操作。</p>
+</li>
+</ul>
+<p>我们说回表操作其实是一个随机<code>IO</code>，比较耗时，所以上述修改虽然只改进了一点点，但是可以省去好多回表操作的成本。设计<code>MySQL</code>的大叔们把他们的这个改进称之为<code>索引条件下推</code>（英文名：<code>Index Condition Pushdown</code>）。</p>
+<p>如果在查询语句的执行过程中将要使用<code>索引条件下推</code>这个特性，在<code>Extra</code>列中将会显示<code>Using index condition</code>，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE key1 &gt; <span class="hljs-string">'z'</span> AND key1 LIKE <span class="hljs-string">'%b'</span>;
+  +----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-----------------------+
+  | id | select_type | table | partitions | <span class="hljs-built_in">type</span>  | possible_keys | key      | key_len | ref  | rows | filtered | Extra                 |
+  +----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-----------------------+
+  |  1 | SIMPLE      | s1    | NULL       | range | idx_key1      | idx_key1 | 303     | NULL |  266 |   100.00 | Using index condition |
+  +----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-----------------------+
+  1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.01 sec)
+</code></pre></li>
+<li>
+<p><code>Using where</code></p>
+<p>当我们使用全表扫描来执行对某个表的查询，并且该语句的<code>WHERE</code>子句中有针对该表的搜索条件时，在<code>Extra</code>列中会提示上述额外信息。比如下边这个查询：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE common_field = <span class="hljs-string">'a'</span>;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra       |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |    10.00 | Using <span class="hljs-built_in">where</span> |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.01 sec)
+</code></pre><p>当使用索引访问来执行对某个表的查询，并且该语句的<code>WHERE</code>子句中有除了该索引包含的列之外的其他搜索条件时，在<code>Extra</code>列中也会提示上述额外信息。比如下边这个查询虽然使用<code>idx_key1</code>索引执行查询，但是搜索条件中除了包含<code>key1</code>的搜索条件<code>key1 = 'a'</code>，还有包含<code>common_field</code>的搜索条件，所以<code>Extra</code>列会显示<code>Using where</code>的提示：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE key1 = <span class="hljs-string">'a'</span> AND common_field = <span class="hljs-string">'a'</span>;
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key      | key_len | ref   | rows | filtered | Extra       |
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | s1    | NULL       | ref  | idx_key1      | idx_key1 | 303     | const |    8 |    10.00 | Using <span class="hljs-built_in">where</span> |
++----+-------------+-------+------------+------+---------------+----------+---------+-------+------+----------+-------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>Using join buffer (Block Nested Loop)</code></p>
+<p>在连接查询执行过程过，当被驱动表不能有效的利用索引加快访问速度，<code>MySQL</code>一般会为其分配一块名叫<code>join buffer</code>的内存块来加快查询速度，也就是我们所讲的<code>基于块的嵌套循环算法</code>，比如下边这个查询语句：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 INNER JOIN s2 ON s1.common_field = s2.common_field;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------------------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra                                              |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------------------------------------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |   100.00 | NULL                                               |
+|  1 | SIMPLE      | s2    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9954 |    10.00 | Using <span class="hljs-built_in">where</span>; Using join buffer (Block Nested Loop) |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------------------------------------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.03 sec)
+</code></pre><p>可以在对<code>s2</code>表的执行计划的<code>Extra</code>列显示了两个提示：</p>
+<ul>
+<li>
+<p><code>Using join buffer (Block Nested Loop)</code>：这是因为对表<code>s2</code>的访问不能有效利用索引，只好退而求其次，使用<code>join buffer</code>来减少对<code>s2</code>表的访问次数，从而提高性能。</p>
+</li>
+<li>
+<p><code>Using where</code>：可以看到查询语句中有一个<code>s1.common_field = s2.common_field</code>条件，因为<code>s1</code>是驱动表，<code>s2</code>是被驱动表，所以在访问<code>s2</code>表时，<code>s1.common_field</code>的值已经确定下来了，所以实际上查询<code>s2</code>表的条件就是<code>s2.common_field = 一个常数</code>，所以提示了<code>Using where</code>额外信息。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><code>Not exists</code></p>
+<p>当我们使用左（外）连接时，如果<code>WHERE</code>子句中包含要求被驱动表的某个列等于<code>NULL</code>值的搜索条件，而且那个列又是不允许存储<code>NULL</code>值的，那么在该表的执行计划的<code>Extra</code>列就会提示<code>Not exists</code>额外信息，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 LEFT JOIN s2 ON s1.key1 = s2.key1 WHERE s2.id IS NULL;
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key      | key_len | ref               | rows | filtered | Extra                   |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL     | NULL    | NULL              | 9688 |   100.00 | NULL                    |
+|  1 | SIMPLE      | s2    | NULL       | ref  | idx_key1      | idx_key1 | 303     | xiaohaizi.s1.key1 |    1 |    10.00 | Using <span class="hljs-built_in">where</span>; Not exists |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>上述查询中<code>s1</code>表是驱动表，<code>s2</code>表是被驱动表，<code>s2.id</code>列是不允许存储<code>NULL</code>值的，而<code>WHERE</code>子句中又包含<code>s2.id IS NULL</code>的搜索条件，这意味着必定是驱动表的记录在被驱动表中找不到匹配<code>ON</code>子句条件的记录才会把该驱动表的记录加入到最终的结果集，所以对于某条驱动表中的记录来说，如果能在被驱动表中找到1条符合<code>ON</code>子句条件的记录，那么该驱动表的记录就不会被加入到最终的结果集，也就是说我们<span style="color:red">没有必要到被驱动表中找到全部符合ON子句条件的记录</span>，这样可以稍微节省一点性能。</p>
+<blockquote class="warning"><p>小贴士：
+
+右（外）连接可以被转换为左（外）连接，所以就不提右（外）连接的情况了。
+</p></blockquote></li>
+<li>
+<p><code>Using intersect(...)</code>、<code>Using union(...)</code>和<code>Using sort_union(...)</code></p>
+<p>如果执行计划的<code>Extra</code>列出现了<code>Using intersect(...)</code>提示，说明准备使用<code>Intersect</code>索引合并的方式执行查询，括号中的<code>...</code>表示需要进行索引合并的索引名称；如果出现了<code>Using union(...)</code>提示，说明准备使用<code>Union</code>索引合并的方式执行查询；出现了<code>Using sort_union(...)</code>提示，说明准备使用<code>Sort-Union</code>索引合并的方式执行查询。比如这个查询的执行计划：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE key1 = <span class="hljs-string">'a'</span> AND key3 = <span class="hljs-string">'a'</span>;
++----+-------------+-------+------------+-------------+-------------------+-------------------+---------+------+------+----------+-------------------------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span>        | possible_keys     | key               | key_len | ref  | rows | filtered | Extra                                           |
++----+-------------+-------+------------+-------------+-------------------+-------------------+---------+------+------+----------+-------------------------------------------------+
+|  1 | SIMPLE      | s1    | NULL       | index_merge | idx_key1,idx_key3 | idx_key3,idx_key1 | 303,303 | NULL |    1 |   100.00 | Using intersect(idx_key3,idx_key1); Using <span class="hljs-built_in">where</span> |
++----+-------------+-------+------------+-------------+-------------------+-------------------+---------+------+------+----------+-------------------------------------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.01 sec)
+</code></pre><p>其中<code>Extra</code>列就显示了<code>Using intersect(idx_key3,idx_key1)</code>，表明<code>MySQL</code>即将使用<code>idx_key3</code>和<code>idx_key1</code>这两个索引进行<code>Intersect</code>索引合并的方式执行查询。</p>
+<blockquote class="warning"><p>小贴士：
+
+剩下两种类型的索引合并的Extra列信息就不一一举例子了，自己写个查询瞅瞅呗～
+</p></blockquote></li>
+<li>
+<p><code>Zero limit</code></p>
+<p>当我们的<code>LIMIT</code>子句的参数为<code>0</code>时，表示压根儿不打算从表中读出任何记录，将会提示该额外信息，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 LIMIT 0;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra      |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------+
+|  1 | SIMPLE      | NULL  | NULL       | NULL | NULL          | NULL | NULL    | NULL | NULL |     NULL | Zero <span class="hljs-built_in">limit</span> |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>Using filesort</code></p>
+<p>有一些情况下对结果集中的记录进行排序是可以使用到索引的，比如下边这个查询：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 ORDER BY key1 LIMIT 10;
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span>  | possible_keys | key      | key_len | ref  | rows | filtered | Extra |
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------+
+|  1 | SIMPLE      | s1    | NULL       | index | NULL          | idx_key1 | 303     | NULL |   10 |   100.00 | NULL  |
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.03 sec)
+</code></pre><p>这个查询语句可以利用<code>idx_key1</code>索引直接取出<code>key1</code>列的10条记录，然后再进行回表操作就好了。但是很多情况下排序操作无法使用到索引，只能在内存中（记录较少的时候）或者磁盘中（记录较多的时候）进行排序，设计<code>MySQL</code>的大叔把这种在内存中或者磁盘上进行排序的方式统称为文件排序（英文名：<code>filesort</code>）。如果某个查询需要使用文件排序的方式执行查询，就会在执行计划的<code>Extra</code>列中显示<code>Using filesort</code>提示，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 ORDER BY common_field LIMIT 10;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra          |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |   100.00 | Using filesort |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>需要注意的是，如果查询中需要使用<code>filesort</code>的方式进行排序的记录非常多，那么这个过程是很耗费性能的，我们最好想办法将使用<code>文件排序</code>的执行方式改为使用索引进行排序。</p>
+</li>
+<li>
+<p><code>Using temporary</code></p>
+<p>在许多查询的执行过程中，<code>MySQL</code>可能会借助临时表来完成一些功能，比如去重、排序之类的，比如我们在执行许多包含<code>DISTINCT</code>、<code>GROUP BY</code>、<code>UNION</code>等子句的查询过程中，如果不能有效利用索引来完成查询，<code>MySQL</code>很有可能寻求通过建立内部的临时表来执行查询。如果查询中使用到了内部的临时表，在执行计划的<code>Extra</code>列将会显示<code>Using temporary</code>提示，比方说这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT DISTINCT common_field FROM s1;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra           |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |   100.00 | Using temporary |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>再比如：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT common_field, COUNT(*) AS amount FROM s1 GROUP BY common_field;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+---------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra                           |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+---------------------------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |   100.00 | Using temporary; Using filesort |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+---------------------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>不知道大家注意到没有，上述执行计划的<code>Extra</code>列不仅仅包含<code>Using temporary</code>提示，还包含<code>Using filesort</code>提示，可是我们的查询语句中明明没有写<code>ORDER BY</code>子句呀？这是因为<code>MySQL</code>会在包含<code>GROUP BY</code>子句的查询中默认添加上<code>ORDER BY</code>子句，也就是说上述查询其实和下边这个查询等价：</p>
+<pre><code class="hljs bash" lang="bash">EXPLAIN SELECT common_field, COUNT(*) AS amount FROM s1 GROUP BY common_field ORDER BY common_field;
+</code></pre><p>如果我们并不想为包含<code>GROUP BY</code>子句的查询进行排序，需要我们显式的写上<code>ORDER BY NULL</code>，就像这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT common_field, COUNT(*) AS amount FROM s1 GROUP BY common_field ORDER BY NULL;
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key  | key_len | ref  | rows | filtered | Extra           |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9688 |   100.00 | Using temporary |
++----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>这回执行计划中就没有<code>Using filesort</code>的提示了，也就意味着执行查询时可以省去对记录进行文件排序的成本了。</p>
+<p>另外，执行计划中出现<code>Using temporary</code>并不是一个好的征兆，因为建立与维护临时表要付出很大成本的，所以我们最好能使用索引来替代掉使用临时表，比方说下边这个包含<code>GROUP BY</code>子句的查询就不需要使用临时表：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT key1, COUNT(*) AS amount FROM s1 GROUP BY key1;
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span>  | possible_keys | key      | key_len | ref  | rows | filtered | Extra       |
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------------+
+|  1 | SIMPLE      | s1    | NULL       | index | idx_key1      | idx_key1 | 303     | NULL | 9688 |   100.00 | Using index |
++----+-------------+-------+------------+-------+---------------+----------+---------+------+------+----------+-------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>从<code>Extra</code>的<code>Using index</code>的提示里我们可以看出，上述查询只需要扫描<code>idx_key1</code>索引就可以搞定了，不再需要临时表了。</p>
+</li>
+<li>
+<p><code>Start temporary, End temporary</code></p>
+<p>我们前边唠叨子查询的时候说过，查询优化器会优先尝试将<code>IN</code>子查询转换成<code>semi-join</code>，而<code>semi-join</code>又有好多种执行策略，当执行策略为<code>DuplicateWeedout</code>时，也就是通过建立临时表来实现为外层查询中的记录进行去重操作时，驱动表查询执行计划的<code>Extra</code>列将显示<code>Start temporary</code>提示，被驱动表查询执行计划的<code>Extra</code>列将显示<code>End temporary</code>提示，就是这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE key1 IN (SELECT key3 FROM s2 WHERE common_field = <span class="hljs-string">'a'</span>);
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key      | key_len | ref               | rows | filtered | Extra                        |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+------------------------------+
+|  1 | SIMPLE      | s2    | NULL       | ALL  | idx_key3      | NULL     | NULL    | NULL              | 9954 |    10.00 | Using <span class="hljs-built_in">where</span>; Start temporary |
+|  1 | SIMPLE      | s1    | NULL       | ref  | idx_key1      | idx_key1 | 303     | xiaohaizi.s2.key3 |    1 |   100.00 | End temporary                |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+------------------------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre></li>
+<li>
+<p><code>LooseScan</code></p>
+<p>在将<code>In</code>子查询转为<code>semi-join</code>时，如果采用的是<code>LooseScan</code>执行策略，则在驱动表执行计划的<code>Extra</code>列就是显示<code>LooseScan</code>提示，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE key3 IN (SELECT key1 FROM s2 WHERE key1 &gt; <span class="hljs-string">'z'</span>);
++----+-------------+-------+------------+-------+---------------+----------+---------+-------------------+------+----------+-------------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span>  | possible_keys | key      | key_len | ref               | rows | filtered | Extra                               |
++----+-------------+-------+------------+-------+---------------+----------+---------+-------------------+------+----------+-------------------------------------+
+|  1 | SIMPLE      | s2    | NULL       | range | idx_key1      | idx_key1 | 303     | NULL              |  270 |   100.00 | Using <span class="hljs-built_in">where</span>; Using index; LooseScan |
+|  1 | SIMPLE      | s1    | NULL       | ref   | idx_key3      | idx_key3 | 303     | xiaohaizi.s2.key1 |    1 |   100.00 | NULL                                |
++----+-------------+-------+------------+-------+---------------+----------+---------+-------------------+------+----------+-------------------------------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.01 sec)
+</code></pre></li>
+<li>
+<p><code>FirstMatch(tbl_name)</code></p>
+<p>在将<code>In</code>子查询转为<code>semi-join</code>时，如果采用的是<code>FirstMatch</code>执行策略，则在被驱动表执行计划的<code>Extra</code>列就是显示<code>FirstMatch(tbl_name)</code>提示，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE common_field IN (SELECT key1 FROM s2 <span class="hljs-built_in">where</span> s1.key3 = s2.key3);
++----+-------------+-------+------------+------+-------------------+----------+---------+-------------------+------+----------+-----------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys     | key      | key_len | ref               | rows | filtered | Extra                       |
++----+-------------+-------+------------+------+-------------------+----------+---------+-------------------+------+----------+-----------------------------+
+|  1 | SIMPLE      | s1    | NULL       | ALL  | idx_key3          | NULL     | NULL    | NULL              | 9688 |   100.00 | Using <span class="hljs-built_in">where</span>                 |
+|  1 | SIMPLE      | s2    | NULL       | ref  | idx_key1,idx_key3 | idx_key3 | 303     | xiaohaizi.s1.key3 |    1 |     4.87 | Using <span class="hljs-built_in">where</span>; FirstMatch(s1) |
++----+-------------+-------+------------+------+-------------------+----------+---------+-------------------+------+----------+-----------------------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 2 warnings (0.00 sec)
+</code></pre></li>
+</ul>
+<h2 class="heading">Json格式的执行计划</h2>
+<p>我们上边介绍的<code>EXPLAIN</code>语句输出中缺少了一个衡量执行计划好坏的重要属性 —— <span style="color:red">成本</span>。不过设计<code>MySQL</code>的大叔贴心的为我们提供了一种查看某个执行计划花费的成本的方式：</p>
+<ul>
+<li>在<code>EXPLAIN</code>单词和真正的查询语句中间加上<code>FORMAT=JSON</code>。</li>
+</ul>
+<p>这样我们就可以得到一个<code>json</code>格式的执行计划，里边儿包含该计划花费的成本，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN FORMAT=JSON SELECT * FROM s1 INNER JOIN s2 ON s1.key1 = s2.key2 WHERE s1.common_field = <span class="hljs-string">'a'</span>\G
+*************************** 1. row ***************************
+
+EXPLAIN: {
+  <span class="hljs-string">"query_block"</span>: {
+    <span class="hljs-string">"select_id"</span>: 1,     <span class="hljs-comment"># 整个查询语句只有1个SELECT关键字，该关键字对应的id号为1</span>
+    <span class="hljs-string">"cost_info"</span>: {
+      <span class="hljs-string">"query_cost"</span>: <span class="hljs-string">"3197.16"</span>   <span class="hljs-comment"># 整个查询的执行成本预计为3197.16</span>
+    },
+    <span class="hljs-string">"nested_loop"</span>: [    <span class="hljs-comment"># 几个表之间采用嵌套循环连接算法执行</span>
+    
+    <span class="hljs-comment"># 以下是参与嵌套循环连接算法的各个表的信息</span>
+      {
+        <span class="hljs-string">"table"</span>: {
+          <span class="hljs-string">"table_name"</span>: <span class="hljs-string">"s1"</span>,   <span class="hljs-comment"># s1表是驱动表</span>
+          <span class="hljs-string">"access_type"</span>: <span class="hljs-string">"ALL"</span>,     <span class="hljs-comment"># 访问方法为ALL，意味着使用全表扫描访问</span>
+          <span class="hljs-string">"possible_keys"</span>: [    <span class="hljs-comment"># 可能使用的索引</span>
+            <span class="hljs-string">"idx_key1"</span>
+          ],
+          <span class="hljs-string">"rows_examined_per_scan"</span>: 9688,   <span class="hljs-comment"># 查询一次s1表大致需要扫描9688条记录</span>
+          <span class="hljs-string">"rows_produced_per_join"</span>: 968,    <span class="hljs-comment"># 驱动表s1的扇出是968</span>
+          <span class="hljs-string">"filtered"</span>: <span class="hljs-string">"10.00"</span>,  <span class="hljs-comment"># condition filtering代表的百分比</span>
+          <span class="hljs-string">"cost_info"</span>: {
+            <span class="hljs-string">"read_cost"</span>: <span class="hljs-string">"1840.84"</span>,     <span class="hljs-comment"># 稍后解释</span>
+            <span class="hljs-string">"eval_cost"</span>: <span class="hljs-string">"193.76"</span>,      <span class="hljs-comment"># 稍后解释</span>
+            <span class="hljs-string">"prefix_cost"</span>: <span class="hljs-string">"2034.60"</span>,   <span class="hljs-comment"># 单次查询s1表总共的成本</span>
+            <span class="hljs-string">"data_read_per_join"</span>: <span class="hljs-string">"1M"</span>  <span class="hljs-comment"># 读取的数据量</span>
+          },
+          <span class="hljs-string">"used_columns"</span>: [     <span class="hljs-comment"># 执行查询中涉及到的列</span>
+            <span class="hljs-string">"id"</span>,
+            <span class="hljs-string">"key1"</span>,
+            <span class="hljs-string">"key2"</span>,
+            <span class="hljs-string">"key3"</span>,
+            <span class="hljs-string">"key_part1"</span>,
+            <span class="hljs-string">"key_part2"</span>,
+            <span class="hljs-string">"key_part3"</span>,
+            <span class="hljs-string">"common_field"</span>
+          ],
+          
+          <span class="hljs-comment"># 对s1表访问时针对单表查询的条件</span>
+          <span class="hljs-string">"attached_condition"</span>: <span class="hljs-string">"((`xiaohaizi`.`s1`.`common_field` = 'a') and (`xiaohaizi`.`s1`.`key1` is not null))"</span>
+        }
+      },
+      {
+        <span class="hljs-string">"table"</span>: {
+          <span class="hljs-string">"table_name"</span>: <span class="hljs-string">"s2"</span>,   <span class="hljs-comment"># s2表是被驱动表</span>
+          <span class="hljs-string">"access_type"</span>: <span class="hljs-string">"ref"</span>,     <span class="hljs-comment"># 访问方法为ref，意味着使用索引等值匹配的方式访问</span>
+          <span class="hljs-string">"possible_keys"</span>: [    <span class="hljs-comment"># 可能使用的索引</span>
+            <span class="hljs-string">"idx_key2"</span>
+          ],
+          <span class="hljs-string">"key"</span>: <span class="hljs-string">"idx_key2"</span>,    <span class="hljs-comment"># 实际使用的索引</span>
+          <span class="hljs-string">"used_key_parts"</span>: [   <span class="hljs-comment"># 使用到的索引列</span>
+            <span class="hljs-string">"key2"</span>
+          ],
+          <span class="hljs-string">"key_length"</span>: <span class="hljs-string">"5"</span>,    <span class="hljs-comment"># key_len</span>
+          <span class="hljs-string">"ref"</span>: [      <span class="hljs-comment"># 与key2列进行等值匹配的对象</span>
+            <span class="hljs-string">"xiaohaizi.s1.key1"</span>
+          ],
+          <span class="hljs-string">"rows_examined_per_scan"</span>: 1,  <span class="hljs-comment"># 查询一次s2表大致需要扫描1条记录</span>
+          <span class="hljs-string">"rows_produced_per_join"</span>: 968,    <span class="hljs-comment"># 被驱动表s2的扇出是968（由于后边没有多余的表进行连接，所以这个值也没啥用）</span>
+          <span class="hljs-string">"filtered"</span>: <span class="hljs-string">"100.00"</span>,     <span class="hljs-comment"># condition filtering代表的百分比</span>
+          
+          <span class="hljs-comment"># s2表使用索引进行查询的搜索条件</span>
+          <span class="hljs-string">"index_condition"</span>: <span class="hljs-string">"(`xiaohaizi`.`s1`.`key1` = `xiaohaizi`.`s2`.`key2`)"</span>,
+          <span class="hljs-string">"cost_info"</span>: {
+            <span class="hljs-string">"read_cost"</span>: <span class="hljs-string">"968.80"</span>,      <span class="hljs-comment"># 稍后解释</span>
+            <span class="hljs-string">"eval_cost"</span>: <span class="hljs-string">"193.76"</span>,      <span class="hljs-comment"># 稍后解释</span>
+            <span class="hljs-string">"prefix_cost"</span>: <span class="hljs-string">"3197.16"</span>,   <span class="hljs-comment"># 单次查询s1、多次查询s2表总共的成本</span>
+            <span class="hljs-string">"data_read_per_join"</span>: <span class="hljs-string">"1M"</span>  <span class="hljs-comment"># 读取的数据量</span>
+          },
+          <span class="hljs-string">"used_columns"</span>: [     <span class="hljs-comment"># 执行查询中涉及到的列</span>
+            <span class="hljs-string">"id"</span>,
+            <span class="hljs-string">"key1"</span>,
+            <span class="hljs-string">"key2"</span>,
+            <span class="hljs-string">"key3"</span>,
+            <span class="hljs-string">"key_part1"</span>,
+            <span class="hljs-string">"key_part2"</span>,
+            <span class="hljs-string">"key_part3"</span>,
+            <span class="hljs-string">"common_field"</span>
+          ]
+        }
+      }
+    ]
+  }
+}
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 2 warnings (0.00 sec)
+</code></pre><p>我们使用<code>#</code>后边跟随注释的形式为大家解释了<code>EXPLAIN FORMAT=JSON</code>语句的输出内容，但是大家可能有疑问<code>"cost_info"</code>里边的成本看着怪怪的，它们是怎么计算出来的？先看<code>s1</code>表的<code>"cost_info"</code>部分：</p>
+<pre><code class="hljs bash" lang="bash"><span class="hljs-string">"cost_info"</span>: {
+    <span class="hljs-string">"read_cost"</span>: <span class="hljs-string">"1840.84"</span>,
+    <span class="hljs-string">"eval_cost"</span>: <span class="hljs-string">"193.76"</span>,
+    <span class="hljs-string">"prefix_cost"</span>: <span class="hljs-string">"2034.60"</span>,
+    <span class="hljs-string">"data_read_per_join"</span>: <span class="hljs-string">"1M"</span>
+}
+</code></pre><ul>
+<li>
+<p><code>read_cost</code>是由下边这两部分组成的：</p>
+<ul>
+<li><code>IO</code>成本</li>
+<li>检测<code>rows × (1 - filter)</code>条记录的<code>CPU</code>成本</li>
+</ul>
+<blockquote class="warning"><p>小贴士：
+
+rows和filter都是我们前边介绍执行计划的输出列，在JSON格式的执行计划中，rows相当于rows_examined_per_scan，filtered名称不变。
+</p></blockquote></li>
+<li>
+<p><code>eval_cost</code>是这样计算的：</p>
+<p>检测 <code>rows × filter</code>条记录的成本。</p>
+</li>
+<li>
+<p><code>prefix_cost</code>就是单独查询<code>s1</code>表的成本，也就是：</p>
+<p><code>read_cost + eval_cost</code></p>
+</li>
+<li>
+<p><code>data_read_per_join</code>表示在此次查询中需要读取的数据量，我们就不多唠叨这个了。</p>
+</li>
+</ul>
+<blockquote class="warning"><p>小贴士：
+
+大家其实没必要关注MySQL为啥使用这么古怪的方式计算出read_cost和eval_cost，关注prefix_cost是查询s1表的成本就好了。
+</p></blockquote><p>对于<code>s2</code>表的<code>"cost_info"</code>部分是这样的：</p>
+<pre><code class="hljs bash" lang="bash"><span class="hljs-string">"cost_info"</span>: {
+    <span class="hljs-string">"read_cost"</span>: <span class="hljs-string">"968.80"</span>,
+    <span class="hljs-string">"eval_cost"</span>: <span class="hljs-string">"193.76"</span>,
+    <span class="hljs-string">"prefix_cost"</span>: <span class="hljs-string">"3197.16"</span>,
+    <span class="hljs-string">"data_read_per_join"</span>: <span class="hljs-string">"1M"</span>
+}
+</code></pre><p>由于<code>s2</code>表是被驱动表，所以可能被读取多次，这里的<code>read_cost</code>和<code>eval_cost</code>是访问多次<code>s2</code>表后累加起来的值，大家主要关注里边儿的<code>prefix_cost</code>的值代表的是整个连接查询预计的成本，也就是单次查询<code>s1</code>表和多次查询<code>s2</code>表后的成本的和，也就是：</p>
+<pre><code class="hljs bash" lang="bash">968.80 + 193.76 + 2034.60 = 3197.16
+</code></pre><h2 class="heading">Extented EXPLAIN</h2>
+<p>最后，设计<code>MySQL</code>的大叔还为我们留了个彩蛋，在我们使用<code>EXPLAIN</code>语句查看了某个查询的执行计划后，紧接着还可以使用<code>SHOW WARNINGS</code>语句查看与这个查询的执行计划有关的一些扩展信息，比如这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT s1.key1, s2.key1 FROM s1 LEFT JOIN s2 ON s1.key1 = s2.key1 WHERE s2.common_field IS NOT NULL;
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span> | possible_keys | key      | key_len | ref               | rows | filtered | Extra       |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------+
+|  1 | SIMPLE      | s2    | NULL       | ALL  | idx_key1      | NULL     | NULL    | NULL              | 9954 |    90.00 | Using <span class="hljs-built_in">where</span> |
+|  1 | SIMPLE      | s1    | NULL       | ref  | idx_key1      | idx_key1 | 303     | xiaohaizi.s2.key1 |    1 |   100.00 | Using index |
++----+-------------+-------+------------+------+---------------+----------+---------+-------------------+------+----------+-------------+
+2 rows <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+
+mysql&gt; SHOW WARNINGS\G
+*************************** 1. row ***************************
+  Level: Note
+   Code: 1003
+Message: /* select<span class="hljs-comment">#1 */ select `xiaohaizi`.`s1`.`key1` AS `key1`,`xiaohaizi`.`s2`.`key1` AS `key1` from `xiaohaizi`.`s1` join `xiaohaizi`.`s2` where ((`xiaohaizi`.`s1`.`key1` = `xiaohaizi`.`s2`.`key1`) and (`xiaohaizi`.`s2`.`common_field` is not null))</span>
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.00 sec)
+</code></pre><p>大家可以看到<code>SHOW WARNINGS</code>展示出来的信息有三个字段，分别是<code>Level</code>、<code>Code</code>、<code>Message</code>。我们最常见的就是<code>Code</code>为<code>1003</code>的信息，当<code>Code</code>值为<code>1003</code>时，<code>Message</code>字段展示的信息<span style="color:red">类似于</span>查询优化器将我们的查询语句重写后的语句。比如我们上边的查询本来是一个左（外）连接查询，但是有一个<code>s2.common_field IS NOT NULL</code>的条件，着就会导致查询优化器把左（外）连接查询优化为内连接查询，从<code>SHOW WARNINGS</code>的<code>Message</code>字段也可以看出来，原本的<code>LEFT JOIN</code>已经变成了<code>JOIN</code>。</p>
+<p>但是大家一定要注意，我们说<code>Message</code>字段展示的信息<span style="color:red">类似于</span>查询优化器将我们的查询语句重写后的语句，并不是等价于，也就是说<code>Message</code>字段展示的信息并不是标准的查询语句，在很多情况下并不能直接拿到黑框框中运行，它只能作为帮助我们理解查<code>MySQL</code>将如何执行查询语句的一个参考依据而已。</p>

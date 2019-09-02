@@ -1,0 +1,367 @@
+<h1 class="heading">otpimizer trace 表的神奇功效</h1>
+<p>标签： MySQL 是怎样运行的</p>
+<hr>
+<p>对于<code>MySQL 5.6</code>以及之前的版本来说，查询优化器就像是一个黑盒子一样，你只能通过<code>EXPLAIN</code>语句查看到最后优化器决定使用的执行计划，却无法知道它为什么做这个决策。这对于一部分喜欢刨根问底的小伙伴来说简直是灾难：“我就觉得使用其他的执行方案比<code>EXPLAIN</code>输出的这种方案强，凭什么优化器做的决定和我想的不一样呢？”</p>
+<p>在<code>MySQL 5.6</code>以及之后的版本中，设计<code>MySQL</code>的大叔贴心的为这部分小伙伴提出了一个<code>optimizer trace</code>的功能，这个功能可以让我们方便的查看优化器生成执行计划的整个过程，这个功能的开启与关闭由系统变量<code>optimizer_trace</code>决定，我们看一下：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; SHOW VARIABLES LIKE <span class="hljs-string">'optimizer_trace'</span>;
++-----------------+--------------------------+
+| Variable_name   | Value                    |
++-----------------+--------------------------+
+| optimizer_trace | enabled=off,one_line=off |
++-----------------+--------------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.02 sec)
+</code></pre><p>可以看到<code>enabled</code>值为<code>off</code>，表明这个功能默认是关闭的。</p>
+<blockquote class="warning"><p>小贴士：
+
+one_line的值是控制输出格式的，如果为on那么所有输出都将在一行中展示，不适合人阅读，所以我们就保持其默认值为off吧。
+</p></blockquote><p>如果想打开这个功能，必须首先把<code>enabled</code>的值改为<code>on</code>，就像这样：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; SET optimizer_trace=<span class="hljs-string">"enabled=on"</span>;
+Query OK, 0 rows affected (0.00 sec)
+</code></pre><p>然后我们就可以输入我们想要查看优化过程的查询语句，当该查询语句执行完成后，就可以到<code>information_schema</code>数据库下的<code>OPTIMIZER_TRACE</code>表中查看完整的优化过程。这个<code>OPTIMIZER_TRACE</code>表有4个列，分别是：</p>
+<ul>
+<li>
+<p><code>QUERY</code>：表示我们的查询语句。</p>
+</li>
+<li>
+<p><code>TRACE</code>：表示优化过程的JSON格式文本。</p>
+</li>
+<li>
+<p><code>MISSING_BYTES_BEYOND_MAX_MEM_SIZE</code>：由于优化过程可能会输出很多，如果超过某个限制时，多余的文本将不会被显示，这个字段展示了被忽略的文本字节数。</p>
+</li>
+<li>
+<p><code>INSUFFICIENT_PRIVILEGES</code>：表示是否没有权限查看优化过程，默认值是0，只有某些特殊情况下才会是<code>1</code>，我们暂时不关心这个字段的值。</p>
+</li>
+</ul>
+<p>完整的使用<code>optimizer trace</code>功能的步骤总结如下：</p>
+<pre><code class="hljs bash" lang="bash"><span class="hljs-comment"># 1. 打开optimizer trace功能 (默认情况下它是关闭的):</span>
+SET optimizer_trace=<span class="hljs-string">"enabled=on"</span>;
+
+<span class="hljs-comment"># 2. 这里输入你自己的查询语句</span>
+SELECT ...; 
+
+<span class="hljs-comment"># 3. 从OPTIMIZER_TRACE表中查看上一个查询的优化过程</span>
+SELECT * FROM information_schema.OPTIMIZER_TRACE;
+
+<span class="hljs-comment"># 4. 可能你还要观察其他语句执行的优化过程，重复上边的第2、3步</span>
+...
+
+<span class="hljs-comment"># 5. 当你停止查看语句的优化过程时，把optimizer trace功能关闭</span>
+SET optimizer_trace=<span class="hljs-string">"enabled=off"</span>;
+</code></pre><p>现在我们有一个搜索条件比较多的查询语句，它的执行计划如下：</p>
+<pre><code class="hljs bash" lang="bash">mysql&gt; EXPLAIN SELECT * FROM s1 WHERE
+    -&gt;     key1 &gt; <span class="hljs-string">'z'</span> AND
+    -&gt;     key2 &lt; 1000000 AND
+    -&gt;     key3 IN (<span class="hljs-string">'a'</span>, <span class="hljs-string">'b'</span>, <span class="hljs-string">'c'</span>) AND
+    -&gt;     common_field = <span class="hljs-string">'abc'</span>;
++----+-------------+-------+------------+-------+----------------------------+----------+---------+------+------+----------+------------------------------------+
+| id | select_type | table | partitions | <span class="hljs-built_in">type</span>  | possible_keys              | key      | key_len | ref  | rows | filtered | Extra                              |
++----+-------------+-------+------------+-------+----------------------------+----------+---------+------+------+----------+------------------------------------+
+|  1 | SIMPLE      | s1    | NULL       | range | idx_key2,idx_key1,idx_key3 | idx_key2 | 5       | NULL |   12 |     0.42 | Using index condition; Using <span class="hljs-built_in">where</span> |
++----+-------------+-------+------------+-------+----------------------------+----------+---------+------+------+----------+------------------------------------+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span>, 1 warning (0.00 sec)
+</code></pre><p>可以看到该查询可能使用到的索引有3个，那么为什么优化器最终选择了<code>idx_key2</code>而不选择其他的索引或者直接全表扫描呢？这时候就可以通过<code>otpimzer trace</code>功能来查看优化器的具体工作过程：</p>
+<pre><code class="hljs bash" lang="bash">SET optimizer_trace=<span class="hljs-string">"enabled=on"</span>;
+
+SELECT * FROM s1 WHERE 
+    key1 &gt; <span class="hljs-string">'z'</span> AND 
+    key2 &lt; 1000000 AND 
+    key3 IN (<span class="hljs-string">'a'</span>, <span class="hljs-string">'b'</span>, <span class="hljs-string">'c'</span>) AND 
+    common_field = <span class="hljs-string">'abc'</span>;
+    
+SELECT * FROM information_schema.OPTIMIZER_TRACE\G    
+</code></pre><p>我们直接看一下通过查询<code>OPTIMIZER_TRACE</code>表得到的输出（我使用<code>#</code>后跟随注释的形式为大家解释了优化过程中的一些比较重要的点，大家重点关注一下）：</p>
+<pre><code class="hljs bash" lang="bash">*************************** 1. row ***************************
+<span class="hljs-comment"># 分析的查询语句是什么</span>
+QUERY: SELECT * FROM s1 WHERE
+    key1 &gt; <span class="hljs-string">'z'</span> AND
+    key2 &lt; 1000000 AND
+    key3 IN (<span class="hljs-string">'a'</span>, <span class="hljs-string">'b'</span>, <span class="hljs-string">'c'</span>) AND
+    common_field = <span class="hljs-string">'abc'</span>
+
+<span class="hljs-comment"># 优化的具体过程</span>
+TRACE: {
+  <span class="hljs-string">"steps"</span>: [
+    {
+      <span class="hljs-string">"join_preparation"</span>: {     <span class="hljs-comment"># prepare阶段</span>
+        <span class="hljs-string">"select#"</span>: 1,
+        <span class="hljs-string">"steps"</span>: [
+          {
+            <span class="hljs-string">"IN_uses_bisection"</span>: <span class="hljs-literal">true</span>
+          },
+          {
+            <span class="hljs-string">"expanded_query"</span>: <span class="hljs-string">"/* select#1 */ select `s1`.`id` AS `id`,`s1`.`key1` AS `key1`,`s1`.`key2` AS `key2`,`s1`.`key3` AS `key3`,`s1`.`key_part1` AS `key_part1`,`s1`.`key_part2` AS `key_part2`,`s1`.`key_part3` AS `key_part3`,`s1`.`common_field` AS `common_field` from `s1` where ((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+          }
+        ] /* steps */
+      } /* join_preparation */
+    },
+    {
+      <span class="hljs-string">"join_optimization"</span>: {    <span class="hljs-comment"># optimize阶段</span>
+        <span class="hljs-string">"select#"</span>: 1,
+        <span class="hljs-string">"steps"</span>: [
+          {
+            <span class="hljs-string">"condition_processing"</span>: {   <span class="hljs-comment"># 处理搜索条件</span>
+              <span class="hljs-string">"condition"</span>: <span class="hljs-string">"WHERE"</span>,
+              <span class="hljs-comment"># 原始搜索条件</span>
+              <span class="hljs-string">"original_condition"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>,
+              <span class="hljs-string">"steps"</span>: [
+                {
+                  <span class="hljs-comment"># 等值传递转换</span>
+                  <span class="hljs-string">"transformation"</span>: <span class="hljs-string">"equality_propagation"</span>,
+                  <span class="hljs-string">"resulting_condition"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+                },
+                {
+                  <span class="hljs-comment"># 常量传递转换    </span>
+                  <span class="hljs-string">"transformation"</span>: <span class="hljs-string">"constant_propagation"</span>,
+                  <span class="hljs-string">"resulting_condition"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+                },
+                {
+                  <span class="hljs-comment"># 去除没用的条件</span>
+                  <span class="hljs-string">"transformation"</span>: <span class="hljs-string">"trivial_condition_removal"</span>,
+                  <span class="hljs-string">"resulting_condition"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+                }
+              ] /* steps */
+            } /* condition_processing */
+          },
+          {
+            <span class="hljs-comment"># 替换虚拟生成列</span>
+            <span class="hljs-string">"substitute_generated_columns"</span>: {
+            } /* substitute_generated_columns */
+          },
+          {
+            <span class="hljs-comment"># 表的依赖信息</span>
+            <span class="hljs-string">"table_dependencies"</span>: [
+              {
+                <span class="hljs-string">"table"</span>: <span class="hljs-string">"`s1`"</span>,
+                <span class="hljs-string">"row_may_be_null"</span>: <span class="hljs-literal">false</span>,
+                <span class="hljs-string">"map_bit"</span>: 0,
+                <span class="hljs-string">"depends_on_map_bits"</span>: [
+                ] /* depends_on_map_bits */
+              }
+            ] /* table_dependencies */
+          },
+          {
+            <span class="hljs-string">"ref_optimizer_key_uses"</span>: [
+            ] /* ref_optimizer_key_uses */
+          },
+          {
+          
+            <span class="hljs-comment"># 预估不同单表访问方法的访问成本</span>
+            <span class="hljs-string">"rows_estimation"</span>: [
+              {
+                <span class="hljs-string">"table"</span>: <span class="hljs-string">"`s1`"</span>,
+                <span class="hljs-string">"range_analysis"</span>: {
+                  <span class="hljs-string">"table_scan"</span>: {   <span class="hljs-comment"># 全表扫描的行数以及成本</span>
+                    <span class="hljs-string">"rows"</span>: 9688,
+                    <span class="hljs-string">"cost"</span>: 2036.7
+                  } /* table_scan */,
+                  
+                  <span class="hljs-comment"># 分析可能使用的索引</span>
+                  <span class="hljs-string">"potential_range_indexes"</span>: [
+                    {
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"PRIMARY"</span>,   <span class="hljs-comment"># 主键不可用</span>
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">false</span>,
+                      <span class="hljs-string">"cause"</span>: <span class="hljs-string">"not_applicable"</span>
+                    },
+                    {
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key2"</span>,  <span class="hljs-comment"># idx_key2可能被使用</span>
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">true</span>,
+                      <span class="hljs-string">"key_parts"</span>: [
+                        <span class="hljs-string">"key2"</span>
+                      ] /* key_parts */
+                    },
+                    {
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key1"</span>,  <span class="hljs-comment"># idx_key1可能被使用</span>
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">true</span>,
+                      <span class="hljs-string">"key_parts"</span>: [
+                        <span class="hljs-string">"key1"</span>,
+                        <span class="hljs-string">"id"</span>
+                      ] /* key_parts */
+                    },
+                    {
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key3"</span>,  <span class="hljs-comment"># idx_key3可能被使用</span>
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">true</span>,
+                      <span class="hljs-string">"key_parts"</span>: [
+                        <span class="hljs-string">"key3"</span>,
+                        <span class="hljs-string">"id"</span>
+                      ] /* key_parts */
+                    },
+                    {
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key_part"</span>,  <span class="hljs-comment"># idx_keypart不可用</span>
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">false</span>,
+                      <span class="hljs-string">"cause"</span>: <span class="hljs-string">"not_applicable"</span>
+                    }
+                  ] /* potential_range_indexes */,
+                  <span class="hljs-string">"setup_range_conditions"</span>: [
+                  ] /* setup_range_conditions */,
+                  <span class="hljs-string">"group_index_range"</span>: {
+                    <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">false</span>,
+                    <span class="hljs-string">"cause"</span>: <span class="hljs-string">"not_group_by_or_distinct"</span>
+                  } /* group_index_range */,
+                  
+                  <span class="hljs-comment"># 分析各种可能使用的索引的成本</span>
+                  <span class="hljs-string">"analyzing_range_alternatives"</span>: {
+                    <span class="hljs-string">"range_scan_alternatives"</span>: [
+                      {
+                        <span class="hljs-comment"># 使用idx_key2的成本分析</span>
+                        <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key2"</span>,
+                        <span class="hljs-comment"># 使用idx_key2的范围区间</span>
+                        <span class="hljs-string">"ranges"</span>: [
+                          <span class="hljs-string">"NULL &lt; key2 &lt; 1000000"</span>
+                        ] /* ranges */,
+                        <span class="hljs-string">"index_dives_for_eq_ranges"</span>: <span class="hljs-literal">true</span>,   <span class="hljs-comment"># 是否使用index dive</span>
+                        <span class="hljs-string">"rowid_ordered"</span>: <span class="hljs-literal">false</span>,     <span class="hljs-comment"># 使用该索引获取的记录是否按照主键排序</span>
+                        <span class="hljs-string">"using_mrr"</span>: <span class="hljs-literal">false</span>,     <span class="hljs-comment"># 是否使用mrr</span>
+                        <span class="hljs-string">"index_only"</span>: <span class="hljs-literal">false</span>,    <span class="hljs-comment"># 是否是索引覆盖访问</span>
+                        <span class="hljs-string">"rows"</span>: 12,     <span class="hljs-comment"># 使用该索引获取的记录条数</span>
+                        <span class="hljs-string">"cost"</span>: 15.41,  <span class="hljs-comment"># 使用该索引的成本</span>
+                        <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">true</span>  <span class="hljs-comment"># 是否选择该索引</span>
+                      },
+                      {
+                        <span class="hljs-comment"># 使用idx_key1的成本分析</span>
+                        <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key1"</span>,
+                        <span class="hljs-comment"># 使用idx_key1的范围区间</span>
+                        <span class="hljs-string">"ranges"</span>: [
+                          <span class="hljs-string">"z &lt; key1"</span>
+                        ] /* ranges */,
+                        <span class="hljs-string">"index_dives_for_eq_ranges"</span>: <span class="hljs-literal">true</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"rowid_ordered"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"using_mrr"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"index_only"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"rows"</span>: 266,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"cost"</span>: 320.21,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"cause"</span>: <span class="hljs-string">"cost"</span>   <span class="hljs-comment"># 因为成本太大所以不选择该索引</span>
+                      },
+                      {
+                        <span class="hljs-comment"># 使用idx_key3的成本分析</span>
+                        <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key3"</span>,
+                        <span class="hljs-comment"># 使用idx_key3的范围区间</span>
+                        <span class="hljs-string">"ranges"</span>: [
+                          <span class="hljs-string">"a &lt;= key3 &lt;= a"</span>,
+                          <span class="hljs-string">"b &lt;= key3 &lt;= b"</span>,
+                          <span class="hljs-string">"c &lt;= key3 &lt;= c"</span>
+                        ] /* ranges */,
+                        <span class="hljs-string">"index_dives_for_eq_ranges"</span>: <span class="hljs-literal">true</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"rowid_ordered"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"using_mrr"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"index_only"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"rows"</span>: 21,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"cost"</span>: 28.21,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">false</span>,   <span class="hljs-comment"># 同上</span>
+                        <span class="hljs-string">"cause"</span>: <span class="hljs-string">"cost"</span>   <span class="hljs-comment"># 同上</span>
+                      }
+                    ] /* range_scan_alternatives */,
+                    
+                    <span class="hljs-comment"># 分析使用索引合并的成本</span>
+                    <span class="hljs-string">"analyzing_roworder_intersect"</span>: {
+                      <span class="hljs-string">"usable"</span>: <span class="hljs-literal">false</span>,
+                      <span class="hljs-string">"cause"</span>: <span class="hljs-string">"too_few_roworder_scans"</span>
+                    } /* analyzing_roworder_intersect */
+                  } /* analyzing_range_alternatives */,
+                  
+                  <span class="hljs-comment"># 对于上述单表查询s1最优的访问方法</span>
+                  <span class="hljs-string">"chosen_range_access_summary"</span>: {
+                    <span class="hljs-string">"range_access_plan"</span>: {
+                      <span class="hljs-string">"type"</span>: <span class="hljs-string">"range_scan"</span>,
+                      <span class="hljs-string">"index"</span>: <span class="hljs-string">"idx_key2"</span>,
+                      <span class="hljs-string">"rows"</span>: 12,
+                      <span class="hljs-string">"ranges"</span>: [
+                        <span class="hljs-string">"NULL &lt; key2 &lt; 1000000"</span>
+                      ] /* ranges */
+                    } /* range_access_plan */,
+                    <span class="hljs-string">"rows_for_plan"</span>: 12,
+                    <span class="hljs-string">"cost_for_plan"</span>: 15.41,
+                    <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">true</span>
+                  } /* chosen_range_access_summary */
+                } /* range_analysis */
+              }
+            ] /* rows_estimation */
+          },
+          {
+            
+            <span class="hljs-comment"># 分析各种可能的执行计划</span>
+            <span class="hljs-comment">#（对多表查询这可能有很多种不同的方案，单表查询的方案上边已经分析过了，直接选取idx_key2就好）</span>
+            <span class="hljs-string">"considered_execution_plans"</span>: [
+              {
+                <span class="hljs-string">"plan_prefix"</span>: [
+                ] /* plan_prefix */,
+                <span class="hljs-string">"table"</span>: <span class="hljs-string">"`s1`"</span>,
+                <span class="hljs-string">"best_access_path"</span>: {
+                  <span class="hljs-string">"considered_access_paths"</span>: [
+                    {
+                      <span class="hljs-string">"rows_to_scan"</span>: 12,
+                      <span class="hljs-string">"access_type"</span>: <span class="hljs-string">"range"</span>,
+                      <span class="hljs-string">"range_details"</span>: {
+                        <span class="hljs-string">"used_index"</span>: <span class="hljs-string">"idx_key2"</span>
+                      } /* range_details */,
+                      <span class="hljs-string">"resulting_rows"</span>: 12,
+                      <span class="hljs-string">"cost"</span>: 17.81,
+                      <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">true</span>
+                    }
+                  ] /* considered_access_paths */
+                } /* best_access_path */,
+                <span class="hljs-string">"condition_filtering_pct"</span>: 100,
+                <span class="hljs-string">"rows_for_plan"</span>: 12,
+                <span class="hljs-string">"cost_for_plan"</span>: 17.81,
+                <span class="hljs-string">"chosen"</span>: <span class="hljs-literal">true</span>
+              }
+            ] /* considered_execution_plans */
+          },
+          {
+            <span class="hljs-comment"># 尝试给查询添加一些其他的查询条件</span>
+            <span class="hljs-string">"attaching_conditions_to_tables"</span>: {
+              <span class="hljs-string">"original_condition"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>,
+              <span class="hljs-string">"attached_conditions_computation"</span>: [
+              ] /* attached_conditions_computation */,
+              <span class="hljs-string">"attached_conditions_summary"</span>: [
+                {
+                  <span class="hljs-string">"table"</span>: <span class="hljs-string">"`s1`"</span>,
+                  <span class="hljs-string">"attached"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key2` &lt; 1000000) and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+                }
+              ] /* attached_conditions_summary */
+            } /* attaching_conditions_to_tables */
+          },
+          {
+            <span class="hljs-comment"># 再稍稍的改进一下执行计划</span>
+            <span class="hljs-string">"refine_plan"</span>: [
+              {
+                <span class="hljs-string">"table"</span>: <span class="hljs-string">"`s1`"</span>,
+                <span class="hljs-string">"pushed_index_condition"</span>: <span class="hljs-string">"(`s1`.`key2` &lt; 1000000)"</span>,
+                <span class="hljs-string">"table_condition_attached"</span>: <span class="hljs-string">"((`s1`.`key1` &gt; 'z') and (`s1`.`key3` in ('a','b','c')) and (`s1`.`common_field` = 'abc'))"</span>
+              }
+            ] /* refine_plan */
+          }
+        ] /* steps */
+      } /* join_optimization */
+    },
+    {
+      <span class="hljs-string">"join_execution"</span>: {    <span class="hljs-comment"># execute阶段</span>
+        <span class="hljs-string">"select#"</span>: 1,
+        <span class="hljs-string">"steps"</span>: [
+        ] /* steps */
+      } /* join_execution */
+    }
+  ] /* steps */
+}
+
+<span class="hljs-comment"># 因优化过程文本太多而丢弃的文本字节大小，值为0时表示并没有丢弃</span>
+MISSING_BYTES_BEYOND_MAX_MEM_SIZE: 0
+
+<span class="hljs-comment"># 权限字段</span>
+INSUFFICIENT_PRIVILEGES: 0
+
+1 row <span class="hljs-keyword">in</span> <span class="hljs-built_in">set</span> (0.00 sec)
+</code></pre><p>大家看到这个输出的第一感觉就是这文本也太多了点儿吧，其实这只是优化器执行过程中的一小部分，设计<code>MySQL</code>的大叔可能会在之后的版本中添加更多的优化过程信息。不过杂乱之中其实还是蛮有规律的，优化过程大致分为了三个阶段：</p>
+<ul>
+<li>
+<p><code>prepare</code>阶段</p>
+</li>
+<li>
+<p><code>optimize</code>阶段</p>
+</li>
+<li>
+<p><code>execute</code>阶段</p>
+</li>
+</ul>
+<p>我们所说的基于成本的优化主要集中在<code>optimize</code>阶段，对于单表查询来说，我们主要关注<code>optimize</code>阶段的<code>"rows_estimation"</code>这个过程，这个过程深入分析了对单表查询的各种执行方案的成本；对于多表连接查询来说，我们更多需要关注<code>"considered_execution_plans"</code>这个过程，这个过程里会写明各种不同的连接方式所对应的成本。反正优化器最终会选择成本最低的那种方案来作为最终的执行计划，也就是我们使用<code>EXPLAIN</code>语句所展现出的那种方案。</p>
+<p>如果有小伙伴对使用<code>EXPLAIN</code>语句展示出的对某个查询的执行计划很不理解，大家可以尝试使用<code>optimizer trace</code>功能来详细了解每一种执行方案对应的成本，相信这个功能能让大家更深入的了解<code>MySQL</code>查询优化器。</p>

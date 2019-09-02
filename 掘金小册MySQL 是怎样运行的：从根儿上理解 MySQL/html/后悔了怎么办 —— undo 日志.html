@@ -1,0 +1,25 @@
+<h1 class="heading">undo 日志</h1>
+<p>标签： MySQL 是怎样运行的</p>
+<hr>
+<h2 class="heading">事务回滚的需求</h2>
+<p>我们说过<code>事务</code>需要保证<code>原子性</code>，也就是事务中的操作要么全部完成，要么什么也不做。但是偏偏有些时候做到一半的时候会出一些情况，比如：</p>
+<ul>
+<li>
+<p>情况一：事务执行过程中可能遇到各种错误，比如服务器本身的错误，操作系统错误，甚至是突然断电导致的错误。</p>
+</li>
+<li>
+<p>情况二：程序员可以在事务执行过程中手动输入<code>ROLLBACK</code>语句结束当前的事务的执行。</p>
+</li>
+</ul>
+<p>这两种情况都会导致事务执行到一半就结束，但是事务执行过程中可能已经修改了很多东西，为了保证事务的原子性，我们需要把东西改回原先的样子，这个过程就称之为<code>回滚</code>（英文名：<code>rollback</code>），这样就可以造成一个假象：<span style="color:red">这个事务看起来什么都没做</span>，所以符合<code>原子性</code>要求。</p>
+<p>小时候我非常痴迷于象棋，总是想找厉害的大人下棋，赢棋是不可能赢棋的，这辈子都不可能赢棋的，又不想认输，只能偷偷的悔棋才能勉强玩的下去。<code>悔棋</code>就是一种非常典型的<code>回滚</code>操作，比如棋子往前走两步，<code>悔棋</code>对应的操作就是向后走两步；比如棋子往左走一步，<code>悔棋</code>对应的操作就是向右走一步。数据库中的回滚跟<code>悔棋</code>差不多，你插入了一条记录，<code>回滚</code>操作对应的就是把这条记录删除掉；你更新了一条记录，<code>回滚</code>操作对应的就是把该记录的更新为旧值；你删除了一条记录，<code>回滚</code>操作对应的自然就是把该记录再插进去。说的貌似很简单的样子[手动偷笑😏]</p>
+<h2 class="heading">具体介绍每一种类型的修改对应的undo日志最小信息。</h2>
+<h2 class="heading">介绍undo记录存储的位置以及具体方式</h2>
+<h3 class="heading">undo表空间</h3>
+<p>innodb_undo_tablespaces</p>
+<p>innodb_undo_directory</p>
+<p>innodb_max_undo_log_size</p>
+<p>innodb_undo_log_truncate</p>
+<p>innodb_undo_logs</p>
+<p>优惠码不好复制，给您单发一下，期盼能有回复🙏🙏</p>
+<h2 class="heading">undo日志的真实格式</h2>
